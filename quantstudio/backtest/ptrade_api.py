@@ -230,6 +230,31 @@ class Context:
         # blotter.current_dt：部分策略用 context.blotter.current_dt.strftime() 取当前日期
         self.blotter = type("_Blotter", (), {"current_dt": self.current_dt})()
 
+    @property
+    def capital_base(self) -> float:
+        """PTrade 平台 context.capital_base 等价语义 —— **恒定初始资金，非活值**。
+
+        单一真源：引擎 _initial_capital（backtest_engine.py:414 由构造参数 capital 写入；
+        先例 result_exporter.py:29 直读同一属性）。
+
+        **为何不以 portfolio 为源**：Context 的 4 处构造点（backtest_engine.py
+        :486 / :2159 / :2264 / :2423）传入 Portfolio(self.account.cash, ...)，
+        而运行期 account.cash 是**活值**（成交后变化），刷新点取值 != 初始资金
+        ==> portfolio 不可作为 capital_base 的来源，仅作无引擎兜底快照。
+
+        无引擎语境（构造期 / 单测 / 非 ptrade 模式）回退 portfolio._init_cash 快照
+        —— 与 Portfolio 既有「构造期快照兜底」设计同构（D4-S7 活属性模式）。
+
+        平台文档说明：Context7 两 PTrade 文档源（/websites/ptradeapi、
+        /kay-ou/ptradeapi）**均未收录** capital_base 条目；本语义依据策略内契约声明
+        （四象限ETF轮动策略.py:26 注释 + :1226 元数据）与引擎初始资金口径确立。
+        """
+        eng = Portfolio._engine()   # 复用唯一解引用点，避免二次解引用漂移窗口
+        init = getattr(eng, "_initial_capital", None) if eng is not None else None
+        if init is not None:
+            return float(init)
+        return float(self.portfolio._init_cash)
+
 
 class BarData:
     """模拟 Ptrade 的 data[security] 返回的 bar 数据"""
