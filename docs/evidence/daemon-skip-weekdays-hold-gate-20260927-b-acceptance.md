@@ -104,7 +104,7 @@
 ## 3. 实证：真实路径 hold 门拒启（§5.6 / ③实施令口径）
 
 **证据文件**：`%TEMP%\qfq_forensics_20260927\b_hold_gate_empirical.json`（脚本
-`verify_b_hold_gate_real.py`，在**真实** `data/daemon_hold.marker` 上执行）。
+`docs/evidence/_b_hold_gate_empirical_runner.py`，在**真实** `data/daemon_hold.marker` 上执行）。
 
 | 阶段 | 观测 |
 |---|---|
@@ -127,6 +127,8 @@
 | `config_legacy_deprecated/collector_tasks.json`（已废弃） | 06:00 | `[6]` | 19 |
 | `agent_workspace/shadow_lockprobe/config/collector_tasks.json`（影子副本） | 06:00 | `[6]` | 88 |
 | `config/collector_tasks.json`（默认 `--config-dir config`） | — | **不存在** | — |
+
+归档 harness：`docs/evidence/_b_scan_profiles.py`（纯只读；运行 `py -3.11 docs/evidence/_b_scan_profiles.py` 即重现上表）。
 
 结论：**无集合分歧**（活跃 profile 与影子副本一律 `[6]`）；默认 config 目录**未声明** `skip_weekdays`
 ⇒ 走缺省分支 = 旧行为（向后兼容，符合 §6 回退条件）。无需行为变更。
