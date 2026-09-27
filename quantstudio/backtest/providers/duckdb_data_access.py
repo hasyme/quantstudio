@@ -796,7 +796,7 @@ class DuckDBDataAccess:
         # 池填充路径：池就绪且当日未预取 ⇒ 一次全池批量预填「同一份窗口缓存」
         if self._bars_pool_set and self._bars_pool_seeded != (bms, qfq):
             W = max(need, self._POOL_W_MIN)
-            for _c, _df in self._query_bars_by_count_batch_impl(list(self._bars_pool), W, bms, qfq).items():
+            for _c, _df in self._query_bars_window_sql(list(self._bars_pool), W, bms, qfq).items():
                 self._bars_window_cache[(_c, bms, qfq)] = _df
             self._bars_pool_seeded = (bms, qfq)
             self._bars_pool_w = W
@@ -808,7 +808,7 @@ class DuckDBDataAccess:
             if self._bars_pool_expansions > self._POOL_EXPAND_LIMIT:
                 self._bars_pool_expand_locked = True
             W = self._POOL_FIXED_W if self._bars_pool_expand_locked else max(need, self._bars_pool_w + 30)
-            for _c, _df in self._query_bars_by_count_batch_impl(list(self._bars_pool), W, bms, qfq).items():
+            for _c, _df in self._query_bars_window_sql(list(self._bars_pool), W, bms, qfq).items():
                 self._bars_window_cache[(_c, bms, qfq)] = _df
             self._bars_pool_w = W
             wide = self._bars_window_cache.get(key, self._BARS_MISS)
@@ -820,6 +820,82 @@ class DuckDBDataAccess:
         if wide is None or len(wide) == 0:
             return {}
         return {code: wide.tail(need).reset_index(drop=True)}
+
+    def _query_bars_window_sql(self, codes, count, before_ms, use_qfq: bool = False) -> Dict[str, pd.DataFrame]:
+        """窗口批量 SQL（单一实现）：主表路由 stock→etf→index + INDEX_ETF_MAP fallback。
+
+        2026-10-01（bars 池预取窗口 SQL 化，纯性能型）：从
+        `_query_bars_by_count_batch_impl` 的 **SQL 分支逐行抽取**（零逻辑改动）——
+        - impl 的 `_use_sql_path=True` 分支改调本方法（回滚语义保持）；
+        - **池预取**（`query_bars_by_count_batch`）改调本方法 ⇒ 只取 W 根窗口，
+          不再触发 `_ensure_bars_in_cache` 的**全历史加载**（本件性能收益来源：
+          原路径拉全历史（每码数千行）后仅 `tail(count)` 取窗口，Python 后处理占 86%）。
+
+        语义：每码 time<=before_ms 的最近 count 根（QUALIFY ROW_NUMBER<=count），
+        列集/排序/qfq/trade_date 后处理与逐只版一致（P2' 逐位比对 600 项 0 不一致）。
+        """
+        conn = self._get_conn()
+        if conn is None:
+            return {}
+        if not codes:
+            return {}
+        count = int(count)
+        INDEX_ETF_MAP = {"000300": "510300", "000905": "510500",
+                         "000016": "510050", "000852": "510880"}
+        TABLE_COLS = {
+            "stock_daily": "code, time, open, high, low, close, volume, amount, pctChg, preClose, turn, peTTM, pbMRQ, open_front, high_front, low_front, close_front",
+            "etf_daily": "code, time, open, high, low, close, volume, amount, pctChg, preClose, turn, NULL as peTTM, NULL as pbMRQ, open_front, high_front, low_front, close_front",
+            "index_daily": "code, time, open, high, low, close, volume, amount, pctChg, NULL as preClose, NULL as turn, NULL as peTTM, NULL as pbMRQ, NULL as open_front, NULL as high_front, NULL as low_front, NULL as close_front",
+        }
+        ETF_FALLBACK_COLS = ("code, time, open, high, low, close, volume, amount, pctChg, preClose, "
+                             "turn, NULL as peTTM, NULL as pbMRQ, open_front, high_front, low_front, close_front")
+
+        result: Dict[str, pd.DataFrame] = {}
+
+        def _post(df, use_qfq):
+            """向量化后处理（与 impl 同款逐行一致）。"""
+            df = df.sort_values(["code", "time"]).reset_index(drop=True)
+            if use_qfq:
+                for orig, qfq in (("open", "open_front"), ("high", "high_front"),
+                                  ("low", "low_front"), ("close", "close_front")):
+                    if qfq in df.columns:
+                        grp = df[qfq].notna().groupby(df["code"]).transform("max")
+                        df.loc[grp, orig] = df.loc[grp, qfq]
+            df["trade_date"] = _build_trade_date_map(df["time"])
+            return df
+
+        for tbl, cols in (("stock_daily", TABLE_COLS["stock_daily"]),
+                          ("etf_daily", TABLE_COLS["etf_daily"]),
+                          ("index_daily", TABLE_COLS["index_daily"])):
+            remaining = [c for c in codes if c not in result]
+            if not remaining:
+                break
+            placeholders = ", ".join(["?"] * len(remaining))
+            sql = (f"SELECT {cols} FROM {tbl} "
+                   f"WHERE code IN ({placeholders}) AND time <= ? "
+                   f"QUALIFY ROW_NUMBER() OVER (PARTITION BY code ORDER BY time DESC) <= ?")
+            df = conn.execute(sql, remaining + [before_ms, count]).fetchdf()
+            if df is None or df.empty:
+                continue
+            df = _post(df, use_qfq)
+            for c, sub in df.groupby("code", sort=False):
+                result[c] = sub.reset_index(drop=True)
+
+        # ---- INDEX_ETF_MAP fallback：仍未命中的指数代码用跟踪 ETF 代理批量查一次 ----
+        missing = [c for c in codes if c not in result and c in INDEX_ETF_MAP]
+        if missing:
+            proxy_map = {INDEX_ETF_MAP[c]: c for c in missing}
+            proxies = list(proxy_map.keys())
+            placeholders = ", ".join(["?"] * len(proxies))
+            sql = (f"SELECT {ETF_FALLBACK_COLS} FROM etf_daily "
+                   f"WHERE code IN ({placeholders}) AND time <= ? "
+                   f"QUALIFY ROW_NUMBER() OVER (PARTITION BY code ORDER BY time DESC) <= ?")
+            df = conn.execute(sql, proxies + [before_ms, count]).fetchdf()
+            if df is not None and not df.empty:
+                df = _post(df, use_qfq)
+                for proxy_code, sub in df.groupby("code", sort=False):
+                    result[proxy_map[proxy_code]] = sub.reset_index(drop=True)
+        return result
 
     def _query_bars_by_count_batch_impl(self, codes, count, before_ms, use_qfq: bool = False) -> Dict[str, pd.DataFrame]:
         """阶段1 批量化：与 query_bars_by_count_multi_table 逐只调用字节级等价，
@@ -836,6 +912,11 @@ class DuckDBDataAccess:
         - 返回 {code: DataFrame}，列/行/排序/qfq/trade_date 与逐只版逐行一致。
         code 用参数化占位（code IN (?, ?, ...)），不拼 f-string，消除 SQL 注入。
         """
+        # 2026-10-01（bars 池预取窗口 SQL 化）：SQL 路径抽取至 _query_bars_window_sql
+        # （单一实现，逐行等价搬运；回滚开关 _use_sql_path 语义保持）。
+        # 本方法其余部分仅剩 PR7 内存缓存路径（按需填充；池预取已改走窗口 SQL）。
+        if self._use_sql_path:
+            return self._query_bars_window_sql(codes, count, before_ms, use_qfq)
         conn = self._get_conn()
         if conn is None:
             return {}
@@ -886,75 +967,48 @@ class DuckDBDataAccess:
             remaining = [c for c in codes if c not in result]
             if not remaining:
                 break
-            if self._use_sql_path:
-                # ---- 原 SQL 路径（保留：等价性对比 / 回滚）----
-                placeholders = ", ".join(["?"] * len(remaining))
-                # QUALIFY 直接写法（等价原「子查询 + 外层 WHERE _rn<=N」，但允许 DuckDB
-                # 优化器下推窗口函数，只取每只最近 N 根，避免大表上先取全量历史再过滤）。
-                # 参数顺序不变：code IN(...) + before_ms(time<=?) + count(QUALIFY<=?)。
-                sql = (f"SELECT {cols} FROM {tbl} "
-                       f"WHERE code IN ({placeholders}) AND time <= ? "
-                       f"QUALIFY ROW_NUMBER() OVER (PARTITION BY code ORDER BY time DESC) <= ?")
-                df = conn.execute(sql, remaining + [before_ms, count]).fetchdf()
-                if df is None or df.empty:
+            # ---- PR7 内存缓存路径：全历史预加载 + time<=before 切片 + tail(count) ----
+            # （SQL 路径已抽取至 _query_bars_window_sql；本方法头部按 _use_sql_path 分流）
+            # 与 SQL 路径逐行等价：缓存来自同一 SELECT 列集；每组取
+            # time<=before_ms 的最近 count 根（缓存已按 (code,time) 升序），
+            # 后处理统一走 _post（排序/qfq 替换/trade_date 与 SQL 版完全一致）。
+            self._ensure_bars_in_cache(remaining, tbl, cols)
+            slices = []
+            for c in remaining:
+                full = self._bars_history_cache.get((tbl, c))
+                if full is None:
                     continue
-                df = _post(df, use_qfq)  # 整表向量化后处理
-                for c, sub in df.groupby("code", sort=False):
-                    result[c] = sub.reset_index(drop=True)
-            else:
-                # ---- PR7 内存缓存路径：全历史预加载 + time<=before 切片 + tail(count) ----
-                # 与 SQL 路径逐行等价：缓存来自同一 SELECT 列集；每组取
-                # time<=before_ms 的最近 count 根（缓存已按 (code,time) 升序），
-                # 后处理统一走 _post（排序/qfq 替换/trade_date 与 SQL 版完全一致）。
-                self._ensure_bars_in_cache(remaining, tbl, cols)
-                slices = []
-                for c in remaining:
-                    full = self._bars_history_cache.get((tbl, c))
-                    if full is None:
-                        continue
-                    sub = full[full["time"] <= before_ms]
-                    if sub.empty:
-                        continue
-                    slices.append(sub.tail(count))
-                if not slices:
+                sub = full[full["time"] <= before_ms]
+                if sub.empty:
                     continue
-                df = _post(pd.concat(slices, ignore_index=True), use_qfq)
-                for c, sub in df.groupby("code", sort=False):
-                    result[c] = sub.reset_index(drop=True)
+                slices.append(sub.tail(count))
+            if not slices:
+                continue
+            df = _post(pd.concat(slices, ignore_index=True), use_qfq)
+            for c, sub in df.groupby("code", sort=False):
+                result[c] = sub.reset_index(drop=True)
 
         # ---- INDEX_ETF_MAP fallback：仍未命中的指数代码用跟踪 ETF 代理批量查一次 ----
         missing = [c for c in codes if c not in result and c in INDEX_ETF_MAP]
         if missing:
             proxy_map = {INDEX_ETF_MAP[c]: c for c in missing}  # proxy_code -> 原 index code
             proxies = list(proxy_map.keys())
-            if self._use_sql_path:
-                placeholders = ", ".join(["?"] * len(proxies))
-                # QUALIFY 直接写法（与循环体同款优化；参数顺序不变：code IN(...) + before_ms + count）。
-                sql = (f"SELECT {ETF_FALLBACK_COLS} FROM etf_daily "
-                       f"WHERE code IN ({placeholders}) AND time <= ? "
-                       f"QUALIFY ROW_NUMBER() OVER (PARTITION BY code ORDER BY time DESC) <= ?")
-                df = conn.execute(sql, proxies + [before_ms, count]).fetchdf()
-                if df is not None and not df.empty:
-                    df = _post(df, use_qfq)  # 整表向量化后处理
-                    for proxy_code, sub in df.groupby("code", sort=False):
-                        # 以原 index code 为 key（单码版 df.code=proxy 但 result key=原 index code）
-                        result[proxy_map[proxy_code]] = sub.reset_index(drop=True)
-            else:
-                # PR7 内存缓存路径：代理 ETF 同样从全历史缓存切片（复用 etf_daily 缓存）。
-                self._ensure_bars_in_cache(proxies, "etf_daily", ETF_FALLBACK_COLS)
-                slices = []
-                for p in proxies:
-                    full = self._bars_history_cache.get(("etf_daily", p))
-                    if full is None:
-                        continue
-                    sub = full[full["time"] <= before_ms]
-                    if sub.empty:
-                        continue
-                    slices.append(sub.tail(count))
-                if slices:
-                    df = _post(pd.concat(slices, ignore_index=True), use_qfq)
-                    for proxy_code, sub in df.groupby("code", sort=False):
-                        result[proxy_map[proxy_code]] = sub.reset_index(drop=True)
+            # PR7 内存缓存路径：代理 ETF 同样从全历史缓存切片（复用 etf_daily 缓存）。
+            # （SQL 路径的代理 fallback 已抽取至 _query_bars_window_sql）
+            self._ensure_bars_in_cache(proxies, "etf_daily", ETF_FALLBACK_COLS)
+            slices = []
+            for p in proxies:
+                full = self._bars_history_cache.get(("etf_daily", p))
+                if full is None:
+                    continue
+                sub = full[full["time"] <= before_ms]
+                if sub.empty:
+                    continue
+                slices.append(sub.tail(count))
+            if slices:
+                df = _post(pd.concat(slices, ignore_index=True), use_qfq)
+                for proxy_code, sub in df.groupby("code", sort=False):
+                    result[proxy_map[proxy_code]] = sub.reset_index(drop=True)
         return result
 
     # ===================== PR3: 分钟 bar 查询 =====================
