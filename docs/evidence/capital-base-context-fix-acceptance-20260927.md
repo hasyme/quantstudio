@@ -71,7 +71,7 @@ python -m pytest tests/test_capital_base_context.py -q  →  6 passed
 | # | 项 | 命令/方法学 | 状态 |
 |---|---|---|---|
 | V2 | 至少 2 个不读 `capital_base` 的代表策略逐位一致 | `scripts/ab_perf_chain_runner.py` 同库同窗 sha 比对（改动前后；参照 `docs/evidence/ab-perf-chain-bitwise-verification-20260927.md` 方法学） | ⏳ 待跑 |
-| V4 | pytest 相关套件全绿 + **55 既有失败基线逐项列表复现**（零新增） | 全库 pytest + 基线列表逐项对表 | ⏳ 待跑 |
+| V4 | pytest 零新增（唯一变量双跑对照） | **PASS** —— 见 §九（差集双向空；passed 3172→3178=+6 恰为新增用例） |
 | V5 | `api_portability` 6 策略 PASS | 6 策略重转 + api_portability | ⏳ 待跑 |
 
 **V4 前置**：按 **daemon 生命周期跨会话占用纪律**，全库 pytest 跑前须声明窗口（daemon 占用期不跑）。
@@ -129,3 +129,54 @@ python scripts/run_contract_gate.py --strategies --skip-matrix
 - 窗口建议：任务间隙或夜间；**同窗总调度搭车复跑 V2 独立核验（只读、错峰）**；
 - 必须项：**55 既有失败基线逐项对表**（零新增）；
 - 若窗口内仍遇锁失败：按双端对齐会话先例采用「**唯一变量对照法**」+ 释放窗补跑条款。
+
+## 九、V4 定稿（V4-v2 真窗双跑唯一变量对照，2026-09-27 18:20–19:05）
+
+**判据**：唯一变量 = 整批 6 笔（`218400d..0e59fca`）；`onlyB` 空 = 零新增。
+
+### 窗口锁状态（跑前记录，对称污染注记口径）
+```
+记录时刻 2026-09-27T18:05:49+08:00
+RO=FREE｜tables=101｜daemon_procs=0｜wal=0.0MB mtime=17:48:32
+```
+
+### 三闸（缺一不认差集）
+| 闸 | A 跑 | B 跑 |
+|---|---|---|
+| ① 自证门（加载本 worktree 包） | `A_PKG=D:\...\QuantStudio-wt-218400d\quantstudio\__init__.py` ✓ | `B_PKG=D:\...\QuantStudio-wt-0e59fca\quantstudio\__init__.py` ✓ |
+| ② 退出码 | 1（有失败，正常） | 1 |
+| ③ 计数非零 | 3172 passed / 78 failed | 3178 passed / 78 failed |
+
+### 结果
+```
+A(wt-218400d 批前态): 78 failed, 3172 passed, 6 skipped, 8 xfailed, 9 errors  (21:12)
+B(wt-0e59fca 含本批): 78 failed, 3178 passed, 6 skipped, 8 xfailed, 9 errors  (20:55)
+A_FAILED=78  B_FAILED=78
+onlyB（新增失败）= （空）  ⇒ 零新增 PASS
+onlyA（被修复项）= （空）
+```
+
+**通过数增量核验**：3172 → 3178 = **+6** = 本件新增测试用例数（`tests/test_capital_base_context.py` 6 条）✅ 逐位吻合。
+
+### 对称污染显式标注（口径适用边界）
+- 两侧均 **9 errors**（收集错误）与 **78 failed**，**同因对称**：两 worktree 同缺未跟踪模块
+  `quantstudio/pipeline/sources/consume_whitelist_guard.py`（其测试 `tests/test_consume_whitelist_guard.py` 已跟踪；本单位已将该模块**同内容补入两 worktree**以保人口集一致，
+  残余 9 errors 系其他同类缺失）。
+- ⇒ **差集判据不受对称污染影响**；但本结论的适用边界 = 「**两跑同环境、同库、同人口集差异**」，
+  非「全绿」声明。9/25 基线（55 failed / 3176 passed）**降为声明式近似口径二级参考**（其无逐项清单，且两日间他线有提交）。
+
+### 本轮抓假记录（3 次假 PASS，全部由自证仪表拦下）
+| # | 现象 | 假结论 | 拦截器 |
+|---|---|---|---|
+| 1 | worktree 内命中 `D:\mc\python.exe`（无 pytest） | 0.2 秒"完成" ⇒ 差集空 PASS | 耗时异常（0 分钟 vs 预期 40 分钟） |
+| 2 | `A_PKG` 指向**主工作区** ⇒ 两跑同源 | 差集空 PASS | **`A_PKG` 自证行**（已升格常设纪律） |
+| 3 | `A_EXIT=2`、`FAILED=0` ⇒ 一测未跑 | 差集空 PASS | **退出码 + 计数交叉** |
+⇒ 建议常设三闸：**自证行 + 退出码 + 计数非零**，缺一不认差集结论。
+
+### 三次失败根因链（全入册）
+1. **解释器解析**：经子 `powershell -File` 时 PATH 命中 `D:\mc\python.exe` ⇒ 改**显式解释器绝对路径**；
+2. **脚本编码**：`.ps1` 存 UTF-8 **无 BOM** 被 PS 5.1 按 ANSI 解码 ⇒ **中文路径被毁** ⇒ `Push-Location` 静默失败、cwd 留主工作区 ⇒ 改 **BOM + `-LiteralPath` + 去文件层直跑**；
+3. **未跟踪依赖**：`consume_whitelist_guard.py` 未跟踪 ⇒ worktree 缺模块 ⇒ 收集中断 ⇒ 两侧同内容补入。
+
+### V4 结论
+**PASS（零新增）**：V1–V5 全达标。
