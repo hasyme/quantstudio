@@ -565,6 +565,10 @@ class DaemonLifecycle:
         success_count = 0
         failed_count = 0
         quality_audit_ok = False
+        # D 件（daemon-interruptible-quality-audit-design.md）：审计中断状态，
+        # 供 run_state 区分「审计完整通过 / 审计被中断 / 审计失败」。
+        qa_interrupted = False
+        qa_skipped = 0
         # Review FIX-2：显式追踪遍历完整性
         eligible_task_count = 0
         attempted_task_count = 0
@@ -595,6 +599,7 @@ class DaemonLifecycle:
                 skip_reason=None, skip_weekday=None, skip_weekday_date=None,
                 started_at=started_at, finished_at=None,
                 success_count=0, failed_count=0, quality_audit_ok=False,
+                interrupted=False, skipped_after_stop=0,
                 task_summary=[], eligible_task_count=0, attempted_task_count=0,
                 traversal_completed=False, stop_requested=False,
             )
@@ -726,12 +731,19 @@ class DaemonLifecycle:
             # Review FIX-1：质量审计开始前消费 stop
             if not stop_requested:
                 _check_stop_at_boundary("pre_quality_audit")
-            # finally 收尾：质量审计（即使 stop 也执行，保证审计覆盖已采集数据）
+            # finally 收尾：质量审计——stop 已消费时按检查点分段中止，避免不可中断
+            # 长尾阻塞优雅停；**已执行项结论保留、未执行项如实标记**（设计 §6 收窄照准）。
+            # 判据只用已缓存标志：stop.request 文件已在上方被消费删除，严禁重读
+            # （设计 §2.4-3 硬不变量）。
             try:
-                quality_audit_ok = collector._run_full_quality_audit()
+                quality_audit_ok = collector._run_full_quality_audit(
+                    should_stop=lambda: stop_requested or not self._running)
             except Exception as e:
                 logger.error(f"[DaemonLifecycle] 质量审计失败: {e}", exc_info=True)
                 quality_audit_ok = False
+            _qa_state = getattr(collector, "_last_quality_audit", None) or {}
+            qa_interrupted = bool(_qa_state.get("interrupted", False))
+            qa_skipped = int(_qa_state.get("skipped_after_stop", 0))
             # 工作包 D 防线 2.1（补充 A）：因子完整性扫描挂必然执行点——与
             # _run_full_quality_audit 并列（finally 必跑），不挂 qfq_run_post_ingest
             # （编排器 disabled 时 post_ingest 是 no-op，因子监测不应依赖编排器开关）。
@@ -768,6 +780,7 @@ class DaemonLifecycle:
                             error=f"{type(e).__name__}: {e}",
                             success_count=success_count, failed_count=failed_count,
                             quality_audit_ok=quality_audit_ok, task_summary=task_summary,
+                            interrupted=qa_interrupted, skipped_after_stop=qa_skipped,
                             eligible_task_count=eligible_task_count,
                             attempted_task_count=attempted_task_count,
                             traversal_completed=False,
@@ -807,6 +820,7 @@ class DaemonLifecycle:
                 finished_at=datetime.now().isoformat(timespec="seconds"),
                 success_count=success_count, failed_count=failed_count,
                 quality_audit_ok=quality_audit_ok, task_summary=task_summary,
+                interrupted=qa_interrupted, skipped_after_stop=qa_skipped,
                 eligible_task_count=eligible_task_count,
                 attempted_task_count=attempted_task_count,
                 traversal_completed=traversal_completed,
@@ -834,6 +848,7 @@ class DaemonLifecycle:
                 reason=interrupt_reason,
                 success_count=success_count, failed_count=failed_count,
                 quality_audit_ok=quality_audit_ok, task_summary=task_summary,
+                interrupted=qa_interrupted, skipped_after_stop=qa_skipped,
                 eligible_task_count=eligible_task_count,
                 attempted_task_count=attempted_task_count,
                 traversal_completed=traversal_completed,

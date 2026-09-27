@@ -43,7 +43,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import pandas as pd
 import sqlite3
@@ -2385,8 +2385,16 @@ class ResidentCollector:
                          f"(rolled back): {e}", exc_info=True)
         return result
 
-    def _run_full_quality_audit(self):
-        """采集完成后执行 Canonical 全库质量审计。"""
+    def _run_full_quality_audit(self, should_stop: Optional[Callable[[], bool]] = None):
+        """采集完成后执行 Canonical 全库质量审计。
+
+        should_stop: 由收尾调用方（daemon_lifecycle.run_one_cycle）注入的停请求判据；
+        判据只读**已缓存**的 stop 标志（daemon_stop.request 在收尾前已被消费删除，
+        重读恒 False）。缺省 None ⇒ 与改前逐位一致（CLI / 测试 / 其余调用点）。
+        审计被中断 ⇒ 记录 self._last_quality_audit 并返回 False（未完整审计，非失败）。
+        """
+        # 本轮审计结论（供 run_one_cycle 落 run_state）；空 dict = 未产出结论。
+        self._last_quality_audit = {}
         hc = self.tasks_cfg.get("health_check", {})
         if not hc.get("full_quality_after_run", True):
             return True
@@ -2408,7 +2416,20 @@ class ResidentCollector:
                 quarantine_path=self.quarantine.db_path,
                 authority_rules=authority_rules,
                 shared_conn=self.writer.shared_conn(),
-                qfq_thresholds=qfq_thresholds).run()
+                qfq_thresholds=qfq_thresholds,
+                should_stop=should_stop).run()
+            interrupted = bool(getattr(report, "interrupted", False))
+            self._last_quality_audit = {
+                "interrupted": interrupted,
+                "skipped_after_stop": int(getattr(report, "skipped_after_stop", 0)),
+            }
+            if interrupted:
+                # 诚实：本轮审计**未完整**（≠ 审计失败，与下方 except 路径文案可区分）
+                logger.warning(
+                    f"[QualityAudit] 收到停止请求，审计已中止：已完成 "
+                    f"{report.checks_run} 项、跳过 {report.skipped_after_stop} 项"
+                    f"（本项为未完整审计，非审计失败）")
+                return False
             errors = [issue for issue in report.issues if issue.severity == "error"]
             warnings = [issue for issue in report.issues if issue.severity == "warning"]
             if errors:
