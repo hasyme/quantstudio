@@ -432,14 +432,17 @@ class DaemonLifecycle:
         sched_cfg = tasks_cfg.get("daemon_schedule", {}) if tasks_cfg else {}
         daily_time = sched_cfg.get("daily_time", "17:00")
         check_interval = sched_cfg.get("check_interval_sec", 300)
+        skip_weekdays = list(sched_cfg.get("skip_weekdays", []) or [])
 
         logger.info(f"[DaemonLifecycle] 启动轻量调度循环。daily_time={daily_time}, "
-                    f"check_interval={check_interval}s, today_completed={is_today_completed()}, "
+                    f"check_interval={check_interval}s, skip_weekdays={skip_weekdays}, "
+                    f"today_completed={is_today_completed()}, "
                     f"today_pending_rerun={is_today_pending_rerun()}")
 
         iteration = 0
         last_daily_time = daily_time
         last_check_interval = check_interval
+        last_skip_weekdays = skip_weekdays
         while self._running:
             iteration += 1
             # 检测停止请求
@@ -451,13 +454,18 @@ class DaemonLifecycle:
             sched_cfg = tasks_cfg.get("daemon_schedule", {}) if tasks_cfg else {}
             daily_time = sched_cfg.get("daily_time", "17:00")
             check_interval = sched_cfg.get("check_interval_sec", 300)
+            skip_weekdays = list(sched_cfg.get("skip_weekdays", []) or [])
             # 配置变化时打日志（便于排查"为何触发时间变了"）
-            if daily_time != last_daily_time or check_interval != last_check_interval:
+            if (daily_time != last_daily_time or check_interval != last_check_interval
+                    or skip_weekdays != last_skip_weekdays):
                 logger.info(f"[DaemonLifecycle] 检测到调度配置变化："
                             f"daily_time {last_daily_time}→{daily_time}, "
                             f"check_interval {last_check_interval}→{check_interval}")
+                logger.info(f"[DaemonLifecycle] skip_weekdays "
+                            f"{last_skip_weekdays}→{skip_weekdays}")
                 last_daily_time = daily_time
                 last_check_interval = check_interval
+                last_skip_weekdays = skip_weekdays
             # 调度判定
             now = datetime.now()
             today_str = now.strftime("%Y-%m-%d")
@@ -468,6 +476,22 @@ class DaemonLifecycle:
             # pending_rerun 场景：首 tick 立即补跑
             if is_today_pending_rerun() and not is_today_completed():
                 should_run = True
+            # §7-1（裁定 P1）：跳过日整体抑制 —— 含上面的 pending_rerun 补跑分支。
+            # 星期口径沿用旧实现（daemon.py:2136 `now.weekday()`）：0=周一 … 6=周日。
+            # 抑制事实写入 run_state（skip_reason=skip_weekday），使「当日为何未跑」可审计；
+            # 每个跳过日只写/记一次，避免每 tick 刷盘刷日志。
+            weekday = now.weekday()
+            if should_run and weekday in skip_weekdays:
+                should_run = False
+                _skip_state = read_run_state() or {}
+                if not (_skip_state.get("skip_reason") == "skip_weekday"
+                        and _skip_state.get("skip_weekday_date") == today_str):
+                    write_run_state(skip_reason="skip_weekday", skip_weekday=weekday,
+                                    skip_weekday_date=today_str)
+                    logger.info(f"[DaemonLifecycle] 今日 weekday={weekday} 属 "
+                                f"skip_weekdays={skip_weekdays}，本日不发起采集轮次"
+                                f"（skip_reason=skip_weekday, pending_rerun="
+                                f"{is_today_pending_rerun()}）")
             if should_run:
                 logger.info(f"[DaemonLifecycle] === 开始每日采集轮次 ({today_str}, daily_time={daily_time}) ===")
                 try:
@@ -568,6 +592,7 @@ class DaemonLifecycle:
             # 拿到 lock，写 running
             write_run_state(
                 scheduled_date=today, run_id=run_id, status="running",
+                skip_reason=None, skip_weekday=None, skip_weekday_date=None,
                 started_at=started_at, finished_at=None,
                 success_count=0, failed_count=0, quality_audit_ok=False,
                 task_summary=[], eligible_task_count=0, attempted_task_count=0,

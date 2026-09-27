@@ -3766,6 +3766,11 @@ def main():
     else:
         # forever 模式：v3 走 DaemonLifecycle 轻量调度（不调用旧 run_forever）
         from .daemon_lifecycle import DaemonLifecycle
+        # 三轮裁定 §3.3 #3：hold 门兜底（必选）——防绕过 launcher 直跑本模块
+        # （`python -m quantstudio.pipeline.daemon`）。时点：取 .daemon.lock **之前**
+        # （下方 lifecycle.acquire_instance_lock）。命中 ⇒ 非零退出 + 留痕。
+        from .daemon_hold_gate import enforce_hold_or_exit
+        enforce_hold_or_exit("quantstudio.pipeline.daemon::main")
         # Review FIX-6：启动日志打印 git commit hash，便于精确验收
         git_commit = _get_git_commit()
         logger.info(f"[CLI] 常驻模式（v3 DaemonLifecycle）max_iter={args.max_iter} "
