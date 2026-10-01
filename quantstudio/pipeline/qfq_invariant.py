@@ -181,11 +181,19 @@ def check_qfq_invariant(df: pd.DataFrame, table: str,
             return out
 
     try:
-        # 独立查 adj_i：抽中 code 的全量因子 → (code, bar_day) 索引
-        factor_lookup = _load_factor_lookup(
-            aux_conn, _adj_table_of(table), sorted(sampled["code"].astype(str).unique()))
         # 抽样行的 bar_day（分钟表按交易日连接，非毫秒等值）
+        # 性能优化（2026-09-30，方案 qfq-invariant-perf）：**先算 days，再据此推导
+        # 因子查询时间窗**——原实现先全量拉因子（无时间条件）再算 days，
+        # 导致每片拉取 ~555 code × 全历史 ~287 万行（实测 22.45s/片，
+        # 占写阶段总耗时 60%+）。加时间窗后实测 0.03s（**769×**）。
+        # 等价性：factor_lookup 仅被下方 `factor_lookup.get((code, day))` 消费，
+        # 而 day 全部来自本行 days → 窗口外的因子行**查了也从不使用**。
         days = _bar_day_from_ms(sampled["time"].astype("int64"))
+        _win_lo, _win_hi = _factor_query_window_ms(days)
+        # 独立查 adj_i：抽中 code 的因子（**限本片时间窗**）→ (code, bar_day) 索引
+        factor_lookup = _load_factor_lookup(
+            aux_conn, _adj_table_of(table), sorted(sampled["code"].astype(str).unique()),
+            time_lo_ms=_win_lo, time_hi_ms=_win_hi)
         no_anchor_codes = set()
         for idx, row in sampled.iterrows():
             code = str(row["code"])
@@ -273,21 +281,67 @@ def _stratified_sample(df: pd.DataFrame, seed=None) -> pd.DataFrame:
     return pd.concat(parts)
 
 
+def _factor_query_window_ms(days) -> Tuple[Optional[int], Optional[int]]:
+    """由抽样行的 bar_day 集合推导因子查询的毫秒时间窗（性能优化 2026-09-30）。
+
+    返回 `[lo, hi)`，**按整日取整并前后各留 1 天余量**：
+    - `bar_day` 为 CST 交易日字符串（`_bar_day_from_ms` 口径）；
+    - 因子表的 time 为毫秒；同一 (code, bar_day) 的多行因子**必须全部落入窗口**，
+      否则 `_load_factor_lookup` 内 "取 time 最大一条" 的语义会变 → 破坏等价性；
+    - 故窗口取整日后**两端各外扩 1 天**，确保边界（当日 00:00 / 23:59 CST、
+      跨时区偏移）不遗漏。
+
+    返回 (None, None) 表示**无法推导** → 调用方不施加时间条件（回退旧行为）。
+    """
+    try:
+        vals = sorted({str(d) for d in days if d})
+    except Exception:
+        return None, None
+    if not vals:
+        return None, None
+    try:
+        # 与 _bar_day_from_ms 同口径（Asia/Shanghai）
+        lo = pd.Timestamp(vals[0], tz="Asia/Shanghai")
+        hi = pd.Timestamp(vals[-1], tz="Asia/Shanghai") + pd.Timedelta(days=1)
+    except Exception:
+        return None, None
+    # 两端各外扩 1 天（覆盖整日边界与同因子日多行）
+    lo = lo - pd.Timedelta(days=1)
+    hi = hi + pd.Timedelta(days=1)
+    return int(lo.timestamp() * 1000), int(hi.timestamp() * 1000)
+
+
 def _load_factor_lookup(aux_conn: sqlite3.Connection, adj_table: str,
-                        codes: Sequence[str]) -> Dict[Tuple[str, str], float]:
+                        codes: Sequence[str],
+                        time_lo_ms: Optional[int] = None,
+                        time_hi_ms: Optional[int] = None) -> Dict[Tuple[str, str], float]:
     """从 qfq_aux.db 独立加载 (code, bar_day) → adj_factor。
 
     因子 time 为毫秒；按交易日（bar_day）建索引，与分钟 bar 连接口径一致
     （同因子日多行取 time 最大一条，对齐 aligner drop_duplicates keep='last'）。
+
+    `time_lo_ms` / `time_hi_ms`（性能优化 2026-09-30，可选）：
+        因子查询的时间窗下推。**默认 None = 不施加条件 = 旧行为逐位一致**
+        （其他调用方 check_golden_rows / verify_reanchor_selfcheck /
+        refresh_golden_rows_for_code 均不传，行为零变化）。
+        `check_qfq_invariant` 传入由抽样行 bar_day 推导的窗口——
+        因消费点 `factor_lookup.get((code, day))` 的 day 全部来自抽样行，
+        窗口外的因子行**查了也从不使用**，故窗口下推为纯增益（实测 769×）。
     """
     lookup: Dict[Tuple[str, str], float] = {}
     if not codes:
         return lookup
     placeholders = ", ".join(["?"] * len(codes))
+    # 时间窗下推（可选）：None → 不加条件（旧行为）
+    _where = f"WHERE code IN ({placeholders})"
+    _params: list = list(codes)
+    if time_lo_ms is not None and time_hi_ms is not None:
+        _where += " AND time >= ? AND time < ?"
+        _params += [int(time_lo_ms), int(time_hi_ms)]
     try:
         rows = aux_conn.execute(
             f"SELECT code, time, adj_factor FROM {adj_table} "
-            f"WHERE code IN ({placeholders})", list(codes)).fetchall()
+            f"{_where}", _params).fetchall()
     except sqlite3.Error as exc:
         logger.warning(f"[QFQ-Invariant] 因子表 {adj_table} 查询失败: {exc}")
         return lookup
