@@ -94,3 +94,12 @@ data/quantstudio.zip
 # Rust hybrid Phase 0 剖析产物（2026-09-20 补充指示③批准：原始 profile 不入 git）
 agent_workspace/phase0/
 *.prof
+
+# agent 会话临时产物（2026-10-01 补充：pytest 临时库 / 沙箱调试目录 / 临时探针目录）
+# 背景：全量同步时误将 76 个临时文件（tmp*.db、tmpdir*/、pytest_basetemp*/）带入仓库，
+# 清理后补规则防复发。真实交付的探针脚本与证据输出（_probe_*/_a1_* 等）仍正常入库。
+agent_workspace/_pytmp*/
+agent_workspace/tmpdir*/
+agent_workspace/pytest_basetemp*/
+agent_workspace/_pt[0-9]*_*/
+agent_workspace/qs_write_lock_dir/

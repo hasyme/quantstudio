@@ -765,3 +765,143 @@ canary and formal watermark release remain unauthorized pending G2 and a
 separate explicit user authorization.  See
 `docs/mcp_migration/b6-formal-cutover-runbook.md` and
 `docs/mcp_migration/b6-post-cutover-observation-runbook.md`.
+
+---
+
+## 全量同步说明（2026-10-01，fork 覆盖推送）
+
+本节对照 `hasyme/quantstudio` fork 与本地工作树的**全部差异**做完整说明。
+本次为**全量覆盖推送**（用户裁定方案 B：以本地为准），fork 原有 5 个提交
+（A/B/D 件 + R1 就绪）已备份至本地分支 `backup_hashyme_main_20261001`，
+如需找回可 `git checkout backup_hashyme_main_20261001`。
+
+**提交**：`7f63f3d`（相对共同祖先 `8264273`，共 271 个文件、+63,376 / −17 行）
+
+### 一、框架性能优化（六步流水线完整闭环）
+
+| 项 | 内容 |
+|---|---|
+| 方案 | `docs/qfq-invariant-perf-design.md` |
+| 审计 | `docs/evidence/caliber-and-qfq-perf-designs-audit-20260930.md`（**通过**，P-1~P-4 小修订已并入） |
+| 实施 | `quantstudio/pipeline/qfq_invariant.py`（+59/−5） |
+| 验收 | `docs/evidence/qfq-invariant-perf-acceptance-20260930.md` |
+
+**问题**：QFQ 写前自检 `check_qfq_invariant` 的 `_load_factor_lookup` 按 code 拉取
+**全历史**因子（~555 code × 287 万行），单次 22.45 s，占写阶段总耗时 **60.3%**
+（实测打点 `invariant=1800.0s / total=2982.8s`）。
+
+**改动**：新增 `_factor_query_window_ms(days)` —— 由抽样行 `bar_day` 推导因子查询
+毫秒窗（整日取整 + **两端各外扩 1 天**），时间条件下推到 SQL；
+`_load_factor_lookup` 增加**可选参数** `time_lo_ms` / `time_hi_ms`。
+
+**语义等价论证**：`factor_lookup` 的唯一消费点是 `factor_lookup.get((code, day))`，
+而 `day` 全部来自**抽样行**（当前分片）→ 窗口外的因子行**查了但从不使用**；
+窗口按整日取整保证同一 `(code, bar_day)` 的全部因子行落入窗口 →
+`keep='last'`（取 time 最大）语义不变。
+
+**实测收益**：净查询 **74.77 s → 0.744 s（100.5×）**；`invariant` 段占比
+60.3% → 约 1%；写阶段 1.32 分钟/片 → 约 0.53 分钟/片。
+
+**等价性验收（硬门）**：A1 同输入下自检结果**逐项一致**——缺失集合相同、
+**取值差异 0**（`VERDICT: EQUIVALENT`）；其余 3 处调用方
+（`check_golden_rows` / `refresh_golden_rows_for_code` / `verify_reanchor_selfcheck`）
+均不传新参数 → 走旧行为分支，**行为逐位一致**。
+
+**通用性横验证（C3）**：6 策略重转 `api_portability` **全 PASS（6/6）**——
+CANSLIM / fall_reversal / tech_etf_mvo_rotation / vol_regime_mom_rev /
+weekly_smallcap_growth / 周频小市值成长动量（三层止损），
+各策略 `convert errors=0` + `validate_ptrade_portability` blocks=0。
+
+> **本优化属「性能优化不得改变引擎行为与逻辑」铁律下的纯优化**：未改变任何
+> API 函数名/签名/默认值/返回类型/返回字段；未改变取数范围、复权口径、
+> 生命周期调用、撮合/费用/持仓语义或任何回测可观察结果。
+
+### 二、云端复权口径复核（金标准终裁）
+
+| 表 | 云端口径 | 是否还原 raw |
+|---|---|---|
+| `stock_daily` | **qfq**（前复权） | ✅ 还原 |
+| `etf_daily` | **qfq** | ✅ 还原 |
+| `etf_minutes` | **qfq** | ✅ 还原 |
+| `stock_minutes` | **raw**（不复权） | ❌ 不还原 |
+
+**金标准方法**（`docs/evidence/caliber-recheck-gold-standard-20260930.md`）：
+用 `amount / volume` **反推真实成交价（VWAP）**——该基准与复权口径**正交**
+（不依赖任何口径判定），是本议题唯一无循环的判据。云端单位：
+日线 vol 以「手」计、amount 以「千元」计 → 隐含价 = `amount/vol × 10`；
+分钟 vol 以「股」计、amount 以「元」计 → 隐含价 = `amount/vol × 1`。
+
+**终裁结论**：两日线表在「大幅度子集」（`|adj_latest/adj_i − 1| > 5%`，
+判定力最强）上 `err_qfq` 比 `err_raw` 小 **32~75 倍** → 云端为 qfq；
+`stock_minutes` 的 `close/implied = 1.0000` → 云端为 raw。
+
+**一次错误复核已推翻并回退**（教训固化）：
+2026-09-30 曾据 `caliber-matrix-full-review-20260930.md` 得出
+「两日线表 = raw」并据此把 `_QFQ_CALIBER_TABLES` 收缩为 `{etf_minutes}`（P1），
+在 P2 重拉中**写入 209,640 行错误数据**（2018-01-02~2018-04-27）。
+该结论的「独立基准」用的是**云端 `stock_minutes`**——而该表同为需判定对象，
+构成**与原矩阵同型的循环论证**。经生产 `UnitCheck` 校验器
+（`amount/(close×volume)≈1`，正交检查）抛出隔离告警后发现，
+已回退代码与测试、修复受损行（重拉 2018-01-01~2018-05-01 并复核通过）。
+
+**代码落点**：`quantstudio/pipeline/sources/mcp_adapter.py` ——
+`_QFQ_CALIBER_TABLES = frozenset({"stock_daily", "etf_daily", "etf_minutes"})`
+（维持原状），还原分支按表判定；元数据新增 `caliber` 字段
+（`"qfq"` / `"raw"`）。历史错误结论文档已就地加 **作废标注**。
+
+### 三、缺陷 1 修复与运维改进
+
+| 文件 | 改动 | 说明 |
+|---|---|---|
+| `quantstudio/pipeline/daemon.py` | +72/−6 | ① `run_once` 窗口覆盖（`--start-date` / `--end-date`，仅本次运行、dict 复制不动 `self.tasks_cfg`）；② 失败任务**跳过** QFQ 收尾链（原条件仅判 `not _cancelled`、**不判 `task_ok`**，导致 fetch 失败仍进入逐股重锚→实测 47 只/5 小时且零写入）；③ 候选链逐源跳过原因（工作包 B，日志面归属，不参与行为/门禁决策） |
+| `quantstudio/pipeline/qfq_resident_orchestrator.py` | +28 | applying 相位**运行预算截断**（本轮截断、下轮续做；未处理者仍为 pending，由下一轮 `recover_pending_due` 幂等回收，不丢不重）；`CycleSummary` 增 `apply_truncated/apply_processed/apply_remaining` |
+| `quantstudio/pipeline/qfq_orchestrator_types.py` | +7 | 新增 `apply_budget_sec`（默认 **1800 s**，**0/负 = 不限**，回退旧行为） |
+| `quantstudio/pipeline/quality_audit.py` | +310 | 新增**口径漂移阻断门禁** `_audit_caliber_drift` —— 监控 `_QFQ_CALIBER_TABLES` 成员表口径翻转，`stock_minutes` 一旦翻转为 qfq 即阻断 |
+| `quantstudio/pipeline/mcp/client.py` | +9 | **TLS 契约修复**：请求级显式传 `verify=self.tls_verify`。仅设 `_session.verify` 不足——请求级 `verify=None` 时 requests 的 `merge_environment_settings` 会优先采用环境变量 `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE`，使自签证书开发 IP（`tls_verify=false`）握手必然失败 |
+| `config/profiles/mcp_only/sources_config.json` | +1 | 启用 `export_async` |
+
+### 四、新增测试套件（+910 行）
+
+| 测试文件 | 用例数 | 覆盖 |
+|---|---|---|
+| `tests/test_caliber_drift_gate.py` | 15 | 口径漂移门禁：成员表翻转阻断 / 非成员表放行 / fail-fast 锁 |
+| `tests/test_restore_to_raw_caliber.py` | 13 | 表级还原语义（日线表应还原）+ A4/R-3 fail-fast 锁 |
+| `tests/test_defect1_repair_completion.py` | 12 | P1 窗口覆盖 + P2① 失败跳过 + P2② 预算截断 |
+| `tests/test_minute_raw_vs_daily.py` | 2 | 分钟 raw 与日线 qfq 的口径区分 |
+
+### 五、证据与设计文档（35 个新增，均入 `docs/`）
+
+- **口径线**：`cloud-caliber-matrix-forensics-20260927.md`（原矩阵取证）、
+  `caliber-recheck-gold-standard-20260930.md`（**金标准终裁 + 完整事故复盘**）、
+  `caliber-drift-gate-forensics-20260928.md`、`etf-minutes-caliber-correction-20260930.md`、
+  `stock-daily-caliber-correction-20260930.md`、`stock-daily-inflation-forensics-20260930.md`
+- **已作废标注**：`caliber-matrix-full-review-20260930.md`（❌ 被金标准推翻）、
+  `caliber-matrix-correction-design.md`（❌❌ 方案作废）、
+  `caliber-matrix-correction-design-v2-reaudit-20260930.md`（❌ 复审结论作废）、
+  `caliber-matrix-correction-v21-acceptance-20260930.md`（❌ 验收作废）
+- **缺陷 1 线**：`defect1-root-cause-confirmed-20260928.md`、
+  `defect1-repair-attempt1-failure-20260928.md`、`defect1-write-phase-bottleneck-20260930.md`、
+  `defect1-a1-validation-20260929.md`、`defect1-a2r1-throughput-20260930.md`、
+  `defect1-a3-baseline-decision-20260930.md`、`defect1-rework-verification-20260929.md` 等
+- **锚点漂移线**：`anchor-drift-forensics-20260926.md`、`anchor-drift-fix-design.md`、
+  `anchor-drift-fix-design-a-prime.md` 及对应审计文档
+- **交付记录**：`docs/handoff/` 下 4 份基线/差异快照
+
+### 六、仓库卫生
+
+本次全量同步中发现 **76 个 pytest 临时产物**
+（`agent_workspace/_pytmp*/tmp*.db`、`tmpdir*/`、`pytest_basetemp*/`）
+曾被误纳入，**已从版本控制移除**，并在 `.gitignore` 补齐对应忽略规则防复发。
+真实交付的探针脚本与证据输出（`agent_workspace/_probe_*`、`_a1_*`、`_b1_*` 等）正常保留入库。
+
+---
+
+### 附：本次同步的完整文件变更清单
+
+| 类别 | 文件数 | 主要路径 |
+|---|---|---|
+| 框架代码 | 7 | `quantstudio/pipeline/{daemon,qfq_invariant,qfq_resident_orchestrator,qfq_orchestrator_types,quality_audit}.py`、`pipeline/mcp/client.py`、`pipeline/sources/mcp_adapter.py` |
+| 测试 | 4 | `tests/test_{caliber_drift_gate,restore_to_raw_caliber,defect1_repair_completion,minute_raw_vs_daily}.py` |
+| 文档 | 35 | `docs/**`（设计 / 审计 / 证据 / 交付记录） |
+| 配置 | 1 | `config/profiles/mcp_only/sources_config.json` |
+| 探针与证据输出 | 148 | `agent_workspace/**`（真实脚本与输出，排除已清理的临时产物） |
