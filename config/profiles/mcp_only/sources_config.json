@@ -9,6 +9,8 @@
       "enable_qfq_injection": true,
       "landing_subdir": "mcp_landing",
       "upstream_authority": "mcp",
+      "export_async": true,
+      "_note_export_async": "2026-09-28 开启：异步导出绕过服务端单作业 60s 软时间预算。背景=缺陷1 数据修复 full_range 重拉第 126/136 批触发 export_exceeds_time_budget（服务器繁忙时同步 export 耗时 11~14s→突破 60s），且失败后框架层陷入无退避重放空转（事故记录见 docs/evidence/defect1-repair-attempt1-failure-20260928.md）。async_mode 为本仓库既有能力（mcp_adapter.py:383 注释、client.py:813），默认关；开启后 create_export_job 立即返回 job_id，由 get_manifest(await_ready=True) 轮询至 ready，超时/失败均显式抛错，不静默返回半成品。",
       "_note": "MCP_API_KEY 从环境变量读取（绝不回显），缺失即 fail-fast（见 MCPClient）。main_db 由 daemon 按 data_config.path 注入。upstream_authority=mcp：transport 与上游权威合一（2026-07-21 分离契约随唯一化废止）。"
     }
   },

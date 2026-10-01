@@ -1,0 +1,8 @@
+=== etf_minutes (2026-06-15) scale=x1 ===
+  n=1522
+  err_raw=0.000001  err_qfq=0.000001  -> RAW
+  [big n=52] err_raw=0.749850 err_qfq=0.666583 -> QFQ
+  sample:
+    159001 close=100.0000 implied=100.0000 al/ai=1.0000
+    159003 close=100.0000 implied=100.0000 al/ai=1.0000
+    159005 close=100.0000 implied=100.0000 al/ai=1.0000

@@ -1,0 +1,7 @@
+etf_daily 云端行数: 3739
+  cols: ['ts_code', 'trade_date', 'pre_close', 'open', 'high', 'low', 'close', 'change', 'pct_chg', 'vol', 'amount', 'adj_factor']
+etf_minutes 云端行数: 336195
+
+=== etf_daily vs etf_minutes(基准) ===
+配对=2789  ratio_median=1.000000  ==1:47.7%
+  raw 假设误差=0.0005  qfq 假设误差=0.9350  -> RAW

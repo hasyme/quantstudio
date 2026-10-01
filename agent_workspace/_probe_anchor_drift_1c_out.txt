@@ -1,0 +1,45 @@
+### 000012  adj_latest=30.5076  段数=16
+
+--- (a) 偏离 bar 整行（含 data_source/update_time） ---
+  列=['time', 'close', 'close_front', 'close_front_ratio', 'close_back', 'close_back_ratio', 'dividend_type', 'data_source', 'update_time', 'preClose']
+  {'time': '2026-06-25 06:59', 'close': 4.81, 'close_front': 4.758832409387742, 'close_front_ratio': None, 'close_back': 7.088894317023316, 'close_back_ratio': None, 'dividend_type': 'all', 'data_source': 'mcp', 'update_time': '2026-09-07 05:55:06', 'preClose': None, 'cf_over_c': 0.989362}
+  {'time': '2026-06-25 07:00', 'close': 4.8, 'close_front': 4.748938786915002, 'close_front_ratio': None, 'close_back': 7.074156491000398, 'close_back_ratio': None, 'dividend_type': 'all', 'data_source': 'mcp', 'update_time': '2026-09-07 05:55:06', 'preClose': None, 'cf_over_c': 0.989362}
+  {'time': '2026-06-26 06:59', 'close': 4.84, 'close_front': 4.788513276805961, 'close_front_ratio': None, 'close_back': 7.133107795092068, 'close_back_ratio': None, 'dividend_type': 'all', 'data_source': 'mcp', 'update_time': '2026-09-07 05:50:14', 'preClose': None, 'cf_over_c': 0.989362}
+  {'time': '2026-06-26 07:00', 'close': 4.83, 'close_front': 4.778619654333221, 'close_front_ratio': None, 'close_back': 7.118369969069151, 'close_back_ratio': None, 'dividend_type': 'all', 'data_source': 'mcp', 'update_time': '2026-09-07 05:50:14', 'preClose': None, 'cf_over_c': 0.989362}
+  {'time': '2026-06-29 06:59', 'close': 4.71, 'close_front': 4.684881111591865, 'close_front_ratio': None, 'close_back': 6.978734326171875, 'close_back_ratio': None, 'dividend_type': 'all', 'data_source': 'mcp', 'update_time': '2026-09-07 05:45:08', 'preClose': None, 'cf_over_c': 0.994667}
+  {'time': '2026-06-29 07:00', 'close': 4.72, 'close_front': 4.6948277806186, 'close_front_ratio': None, 'close_back': 6.993551171875, 'close_back_ratio': None, 'dividend_type': 'all', 'data_source': 'mcp', 'update_time': '2026-09-07 05:45:08', 'preClose': None, 'cf_over_c': 0.994667}
+  {'time': '2026-07-01 06:59', 'close': 5.28, 'close_front': 5.223832665606503, 'close_front_ratio': None, 'close_back': 5.251841246115722, 'close_back_ratio': None, 'dividend_type': 'all', 'data_source': 'mcp', 'update_time': '2026-09-07 05:27:03', 'preClose': None, 'cf_over_c': 0.989362}
+  {'time': '2026-07-01 07:00', 'close': 5.28, 'close_front': 5.223832665606503, 'close_front_ratio': None, 'close_back': 5.251841246115722, 'close_back_ratio': None, 'dividend_type': 'all', 'data_source': 'mcp', 'update_time': '2026-09-07 05:27:03', 'preClose': None, 'cf_over_c': 0.989362}
+
+--- (b) stock_daily vs stock_minutes 同 code 同日期 ---
+  stock_daily 行数=14
+  date           d_close   d_front   d_ratio   m_close   m_front   m_ratio    expect
+  2026-06-21      4.7300    4.7048  0.994667     (无分钟)
+  2026-06-22      4.6700    4.6451  0.994667     (无分钟)
+  2026-06-23      4.6300    4.6053  0.994667     (无分钟)
+  2026-06-24      4.7700    4.7446  0.994667    4.8100    4.7588  0.989362  0.994667
+  2026-06-25      4.8000    4.7744  0.994667    4.8400    4.7885  0.989362  0.994667
+  2026-06-28      4.6900    4.6650  0.994667    4.7100    4.6849  0.994667  0.994667
+  2026-06-29      5.1600    5.1325  0.994667     (无分钟)
+  2026-06-30      5.2500    5.2220  0.994667    5.2800    5.2238  0.989362  0.994667
+  2026-07-01      5.0200    4.9932  0.994667    5.0600    5.0062  0.989362  0.994667
+  2026-07-02      5.1000    5.0728  0.994667    5.1300    5.0754  0.989362  0.994667
+  2026-07-05      4.6200    4.5954  0.994667    4.6400    4.6153  0.994667  0.994667
+  2026-07-06      4.2300    4.2074  0.994667    4.2500    4.2048  0.989362  0.994667
+  2026-07-07      4.1800    4.1577  0.994667    4.2100    4.1652  0.989362  0.994667
+  2026-07-08      4.3100    4.2870  0.994667    4.3069    4.2839  0.994667  0.994667
+
+--- (c) 全表 000012：actual 与 expect / expect^2 的吻合度 ---
+  bar 数=252
+  |actual/expect - 1|      : max=0.005333  >0.5%=18
+  |actual/expect^2 - 1|    : max=0.005362  >0.5%=172
+  -> 若后者显著更小，则 actual==expect^2 成立（双重复权实锤）
+
+       adj_i     expect      n    dev_med  devsq_med
+     30.3449   0.994667    190   0.000000   0.005362
+     30.5076   1.000000     62   0.000000   0.000000
+
+--- (d) 反解：close_front/close = adj_i / X  →  X = ? ---
+  偏离 bar 反解 X 值: [30.671172]
+  当前 adj_latest          = 30.5076
+  因子段值(去重)=[20.48, 23.7419, 23.742, 26.405, 26.778, 26.7784, 27.053, 27.7783, 27.779, 28.486, 28.4861, 29.9276, 30.3449, 30.5076]

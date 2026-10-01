@@ -1,0 +1,14 @@
+=== A1 等价性验证 ===
+样本 bar 数: 80, code 数: 40
+窗口: 2026-01-11 00:00:00+08:00 .. 2026-01-15 00:00:00+08:00
+
+factor_lookup 键数: old=74727  new=96
+键集合相等: False
+逐键值差异数: 0
+
+check_qfq_invariant 结果(seed=42):
+  sampled              = 64
+  bad                  = 64
+  skipped              = 16
+  unknown_rows         = 0
+  cross_source_adj_i   = 80

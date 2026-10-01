@@ -1,0 +1,7 @@
+=== stock_minutes (2026-06-15) ===
+  n=5196  err_raw=0.900000  err_qfq=0.900000  -> QFQ
+  [big n=171] err_raw=0.900000 err_qfq=0.869359 -> QFQ
+
+=== etf_minutes (2026-06-15) ===
+  n=1522  err_raw=0.900000  err_qfq=0.900000  -> QFQ
+  [big n=48] err_raw=0.974988 err_qfq=0.949998 -> QFQ

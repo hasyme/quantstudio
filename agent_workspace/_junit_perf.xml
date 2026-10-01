@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="3" failures="0" skipped="0" tests="18" time="4.164" timestamp="2026-09-30T13:13:00.944319+08:00" hostname="meow-pc"><testcase classname="tests.test_qfq_invariant" name="test_1_invariant_pass" time="0.242" /><testcase classname="tests.test_qfq_invariant" name="test_2_invariant_catches_front_eq_raw" time="0.009" /><testcase classname="tests.test_qfq_invariant" name="test_3_skip_three_kinds" time="0.010" /><testcase classname="tests.test_qfq_invariant" name="test_4_relative_tolerance" time="0.013" /><testcase classname="tests.test_qfq_invariant" name="test_5_minute_bar_day_join" time="0.016" /><testcase classname="tests.test_qfq_invariant" name="test_6_no_anchor_skip_all" time="0.003" /><testcase classname="tests.test_qfq_invariant" name="test_7_factor_integrity_scan" time="0.521" /><testcase classname="tests.test_qfq_invariant" name="test_7b_single_day_spike_detection" time="0.022" /><testcase classname="tests.test_qfq_invariant" name="test_8_anchor_a_consistency_r3" time="0.013" /><testcase classname="tests.test_qfq_invariant" name="test_verify_reanchor_selfcheck_pass_and_catch" time="0.054" /><testcase classname="tests.test_qfq_invariant" name="test_b2_save_and_refresh_golden_rows" time="0.009"><error message="failed on setup with &quot;PermissionError: [WinError 5] 拒绝访问。: 'D:\\hasym\\PycharmProjects\\QuantStudio\\agent_workspace\\_pt_perf_848758084'&quot;">C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:361: in from_call
+    result: TResult | None = func()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:250: in &lt;lambda&gt;
+    lambda: runtest_hook(item=item, **kwds),
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_hooks.py:512: in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_manager.py:120: in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\logging.py:858: in pytest_runtest_setup
+    yield
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\capture.py:895: in pytest_runtest_setup
+    return (yield)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:170: in pytest_runtest_setup
+    item.session._setupstate.setup(item)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:536: in setup
+    col.setup()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\python.py:1710: in setup
+    self._request._fillfixtures()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:806: in _fillfixtures
+    item.funcargs[argname] = self.getfixturevalue(argname)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:630: in getfixturevalue
+    fixturedef = self._get_active_fixturedef(argname)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:726: in _get_active_fixturedef
+    fixturedef.execute(request=subrequest)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:1232: in execute
+    result: FixtureValue = ihook.pytest_fixture_setup(
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_hooks.py:512: in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_manager.py:120: in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py:53: in run_old_style_hookwrapper
+    return result.get_result()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py:38: in run_old_style_hookwrapper
+    res = yield
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\setuponly.py:36: in pytest_fixture_setup
+    return (yield)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:1328: in pytest_fixture_setup
+    result = call_fixture_func(fixturefunc, request, kwargs)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:998: in call_fixture_func
+    fixture_result = next(generator)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py:300: in tmp_path
+    path = _mk_tmp(request, tmp_path_factory)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py:287: in _mk_tmp
+    return factory.mktemp(name, numbered=True)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py:141: in mktemp
+    p = make_numbered_dir(root=self.getbasetemp(), prefix=basename, mode=0o700)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py:228: in make_numbered_dir
+    max_existing = max(map(parse_num, find_suffixes(root, prefix)), default=-1)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py:187: in extract_suffixes
+    for entry in iter:
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py:175: in find_prefixed
+    for x in os.scandir(root):
+E   PermissionError: [WinError 5] 拒绝访问。: 'D:\\hasym\\PycharmProjects\\QuantStudio\\agent_workspace\\_pt_perf_848758084'</error></testcase><testcase classname="tests.test_qfq_invariant" name="test_c_cross_source_wiring_real_config" time="0.794" /><testcase classname="tests.test_qfq_invariant" name="test_c_orchestrator_config_field_wired" time="0.020" /><testcase classname="tests.test_qfq_invariant" name="test_d_streak_distinct_batch_and_auto_unblock" time="0.003"><error message="failed on setup with &quot;PermissionError: [WinError 5] 拒绝访问。: 'D:\\hasym\\PycharmProjects\\QuantStudio\\agent_workspace\\_pt_perf_848758084'&quot;">C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:361: in from_call
+    result: TResult | None = func()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:250: in &lt;lambda&gt;
+    lambda: runtest_hook(item=item, **kwds),
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_hooks.py:512: in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_manager.py:120: in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\logging.py:858: in pytest_runtest_setup
+    yield
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\capture.py:895: in pytest_runtest_setup
+    return (yield)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:170: in pytest_runtest_setup
+    item.session._setupstate.setup(item)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:536: in setup
+    col.setup()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\python.py:1710: in setup
+    self._request._fillfixtures()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:806: in _fillfixtures
+    item.funcargs[argname] = self.getfixturevalue(argname)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:630: in getfixturevalue
+    fixturedef = self._get_active_fixturedef(argname)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:726: in _get_active_fixturedef
+    fixturedef.execute(request=subrequest)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:1232: in execute
+    result: FixtureValue = ihook.pytest_fixture_setup(
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_hooks.py:512: in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_manager.py:120: in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py:53: in run_old_style_hookwrapper
+    return result.get_result()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py:38: in run_old_style_hookwrapper
+    res = yield
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\setuponly.py:36: in pytest_fixture_setup
+    return (yield)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:1328: in pytest_fixture_setup
+    result = call_fixture_func(fixturefunc, request, kwargs)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:998: in call_fixture_func
+    fixture_result = next(generator)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py:300: in tmp_path
+    path = _mk_tmp(request, tmp_path_factory)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py:287: in _mk_tmp
+    return factory.mktemp(name, numbered=True)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py:141: in mktemp
+    p = make_numbered_dir(root=self.getbasetemp(), prefix=basename, mode=0o700)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py:228: in make_numbered_dir
+    max_existing = max(map(parse_num, find_suffixes(root, prefix)), default=-1)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py:187: in extract_suffixes
+    for entry in iter:
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py:175: in find_prefixed
+    for x in os.scandir(root):
+E   PermissionError: [WinError 5] 拒绝访问。: 'D:\\hasym\\PycharmProjects\\QuantStudio\\agent_workspace\\_pt_perf_848758084'</error></testcase><testcase classname="tests.test_qfq_invariant" name="test_e_paged_full_read_no_truncation" time="0.020" /><testcase classname="tests.test_qfq_invariant" name="test_t1_r3_reload_counts_unknown_not_bad" time="0.015" /><testcase classname="tests.test_qfq_invariant" name="test_t1_in_row_factor_same_source_kills_cross_source_false_positive" time="0.016" /><testcase classname="tests.test_qfq_invariant" name="test_t2_block_rule_single_batch_10pct_no_block" time="0.003"><error message="failed on setup with &quot;PermissionError: [WinError 5] 拒绝访问。: 'D:\\hasym\\PycharmProjects\\QuantStudio\\agent_workspace\\_pt_perf_848758084'&quot;">C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:361: in from_call
+    result: TResult | None = func()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:250: in &lt;lambda&gt;
+    lambda: runtest_hook(item=item, **kwds),
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_hooks.py:512: in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_manager.py:120: in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\logging.py:858: in pytest_runtest_setup
+    yield
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\capture.py:895: in pytest_runtest_setup
+    return (yield)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:170: in pytest_runtest_setup
+    item.session._setupstate.setup(item)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\runner.py:536: in setup
+    col.setup()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\python.py:1710: in setup
+    self._request._fillfixtures()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:806: in _fillfixtures
+    item.funcargs[argname] = self.getfixturevalue(argname)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:630: in getfixturevalue
+    fixturedef = self._get_active_fixturedef(argname)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:726: in _get_active_fixturedef
+    fixturedef.execute(request=subrequest)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:1232: in execute
+    result: FixtureValue = ihook.pytest_fixture_setup(
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_hooks.py:512: in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_manager.py:120: in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py:53: in run_old_style_hookwrapper
+    return result.get_result()
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py:38: in run_old_style_hookwrapper
+    res = yield
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\setuponly.py:36: in pytest_fixture_setup
+    return (yield)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:1328: in pytest_fixture_setup
+    result = call_fixture_func(fixturefunc, request, kwargs)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\fixtures.py:998: in call_fixture_func
+    fixture_result = next(generator)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py:300: in tmp_path
+    path = _mk_tmp(request, tmp_path_factory)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py:287: in _mk_tmp
+    return factory.mktemp(name, numbered=True)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py:141: in mktemp
+    p = make_numbered_dir(root=self.getbasetemp(), prefix=basename, mode=0o700)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py:228: in make_numbered_dir
+    max_existing = max(map(parse_num, find_suffixes(root, prefix)), default=-1)
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py:187: in extract_suffixes
+    for entry in iter:
+C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py:175: in find_prefixed
+    for x in os.scandir(root):
+E   PermissionError: [WinError 5] 拒绝访问。: 'D:\\hasym\\PycharmProjects\\QuantStudio\\agent_workspace\\_pt_perf_848758084'</error></testcase></testsuite></testsuites>

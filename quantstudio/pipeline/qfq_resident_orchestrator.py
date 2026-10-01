@@ -133,6 +133,12 @@ class CycleSummary:
     status: str = "finalized"
     error: Optional[str] = None
     gate_report: Dict = field(default_factory=dict)
+    # P2②（2026-09-29，缺陷1 修复收尾方案 §3.P2）：逐股重锚链预算截断记账。
+    # apply_truncated=True → applying 相位因预算到点提前退出（本轮截断、下轮续做）；
+    # apply_processed 本次处理数；apply_remaining 留在 pending 待下轮的数量。
+    apply_truncated: bool = False
+    apply_processed: int = 0
+    apply_remaining: int = 0
 
 
 @dataclass
@@ -1478,13 +1484,35 @@ class QFQResidentOrchestrator:
             summary.claimed = len(units)
 
             self._set_cycle_phase(conn, cycle_id, "applying")
+            # P2②（2026-09-29，缺陷1 修复收尾方案 §3.P2）：逐股重锚链运行预算。
+            # 此前该循环无任何上限——2026-09-28 事故实测 47 只/5 小时（6.4 min/只），
+            # 全市场 5,247 只 ≈ 数周量级、CPU ~120% 且零写入。
+            # 语义 = **本轮截断、下轮续做**：预算到点即停止处理剩余 units，
+            # 已处理者照常进入 gate；未处理者仍为 qfq_trigger_queue 的 pending，
+            # 由下一轮的 recover_pending_due 回收（不丢不重，状态机既有幂等）。
+            # 预算 0/负 = 不限（回退旧行为，保证既有配置零行为变化）。
+            import time as _t_apply
+            _apply_t0 = _t_apply.monotonic()
+            _budget = int(getattr(self.cfg, "apply_budget_sec", 0) or 0)
+            _processed = 0
             for unit in units:
+                if _budget > 0 and _processed > 0 \
+                        and (_t_apply.monotonic() - _apply_t0) >= _budget:
+                    summary.apply_truncated = True
+                    summary.apply_remaining = len(units) - _processed
+                    logger.warning(
+                        f"[qfq_orch] applying 预算到点（{_budget}s，已处理 {_processed}"
+                        f"/{len(units)} 只）→ 本轮截断，剩余 {summary.apply_remaining} 只"
+                        f"留在 pending 待下轮续做（cycle={cycle_id}）")
+                    break
                 outcome = self._reanchor_security(
                     conn, run_id=run_id, asset_type=unit["asset_type"], code=unit["code"],
                     trigger_ids=unit["triggers"], effective_dates=unit["effective_dates"],
                     attempt=int(unit.get("attempt", 0)) + 1, fetcher=fetcher)
                 self._apply_trigger_outcome(conn, run_id=run_id, unit=unit,
                                             outcome=outcome, fetcher=fetcher, summary=summary)
+                _processed += 1
+            summary.apply_processed = _processed
 
             self._set_cycle_phase(conn, cycle_id, "gating")
             passed, report = self._qfq_gate(

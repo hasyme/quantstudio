@@ -1,0 +1,9 @@
+=== 云端 stock_daily 口径判定（以云端 minutes raw 为独立基准）===
+配对: 10351
+cloud_daily/cloud_raw: median=0.996945  ==1:32.1%
+
+按 adj_factor 分组看比值:
+  adj==1.0         n=208    ratio_median=1.0000  ==1:43.3%
+  1.0<adj<=1.05    n=1486   ratio_median=1.0000  ==1:40.9%
+  1.05<adj<=1.5    n=1669   ratio_median=1.0000  ==1:33.5%
+  adj>1.5          n=6988   ratio_median=0.9949  ==1:29.6%

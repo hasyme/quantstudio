@@ -180,6 +180,10 @@ class ResidentCollector:
     _last_task_actual_source = None
     _last_task_watermark_candidate_created = False
     _last_task_qfq_managed = False
+    # 工作包 B（2026-09-23 诊断性修复）：最近一次候选链解析的逐源跳过原因。
+    # 仅用于 ERROR 文案归属（日志面），不参与任何行为/门禁/水位决策；
+    # 类级缺省 None 兼容 ResidentCollector.__new__() 构造路径。
+    _last_source_chain_skips = None
     # —— 工作包 D（防线 1）：QFQ 写入自检状态（类级缺省 None，惰性初始化，
     #    兼容 ResidentCollector.__new__() 构造路径；线程安全见 _qfq_inv_state）。
     #    注意（任务书补充 B）：这里存的是告警升级计数，不是快照——快照必须
@@ -550,8 +554,13 @@ class ResidentCollector:
             return False
         chain = self._resolve_source_chain(task)
         if not chain:
+            # 工作包 B：附逐源跳过原因（未启用 / 不支持 / 适配器不可用+异常摘要），
+            # 使「配置缺失」与「传输层故障」可一眼区分（此前统一报成配置缺失，
+            # 曾把 TLS 握手失败误导为「无已启用且支持的源」）。
+            skips = getattr(self, "_last_source_chain_skips", None) or []
             logger.error(f"[task={name}] 无可用数据源（{table}/{freq}）："
-                         f"source_priority/source 中无已启用且支持该表+freq 的源")
+                         f"source_priority/source 中无已启用且支持该表+freq 的源"
+                         + (f"；逐源跳过原因: {skips}" if skips else ""))
             return False
         last_err = None
         for idx, source in enumerate(chain):
@@ -652,7 +661,24 @@ class ResidentCollector:
             raise
         finally:
             _cancelled = bool(self._task_cancelled)
-            if (not _cancelled) and owns_qfq_cycle and self._qfq_cycle_id is not None:
+            # P2①（2026-09-29，缺陷1 修复收尾方案 §3.P2）：失败任务跳过 QFQ 收尾链。
+            # 根因：此前条件仅判 `not _cancelled`，**不判 task_ok** → 任务失败（如 fetch
+            # 阶段 budget 错误）仍进入 qfq_run_post_ingest → orchestrator 逐股重锚
+            # （qfq_resident_orchestrator.py:1481 `for unit in units:` 无界）→ 实测
+            # 47 只/5 小时（约 6.4 min/只），全市场 5,247 只 ≈ 数周量级、
+            # 期间 CPU ~120% 且零写入（2026-09-28 事故，证据见
+            # docs/evidence/defect1-rework-verification-20260929.md §1）。
+            # 语义：失败 = ingest 不完整 → 水位本就不会推进（gate 必 hold），
+            # 故跑重锚链无收益且阻塞排程。跳过是纯收益。
+            # cycle 处置：与 TaskCancelled 分支同构——**保持悬置**（本分支不读写
+            # cycle 状态机，v2 定案），由下一次成功轮次的
+            # `recover_stale_in_progress` / `recover_pending_due` 幂等回收。
+            if (not _cancelled) and not task_ok and owns_qfq_cycle:
+                logger.warning(
+                    f"[task={run_task.get('name')}] task_ok=False → 跳过 QFQ post-ingest"
+                    f"（水位保持；避免无界逐股重锚链）；cycle 保持悬置待下次成功轮次回收")
+            if ((not _cancelled) and task_ok and owns_qfq_cycle
+                    and self._qfq_cycle_id is not None):
                 run_id = f"manual_{run_task.get('name', 'task')}_{uuid.uuid4().hex[:12]}"
                 self._last_qfq_cycle_summary = self.qfq_run_post_ingest(run_id)
             if run_quality_audit and not _cancelled:
@@ -2155,7 +2181,9 @@ class ResidentCollector:
 
     def run_once(self, task_name: Optional[str] = None,
                  mode: str = "incremental",
-                 quality_audit: str = "full"):
+                 quality_audit: str = "full",
+                 start_date: Optional[str] = None,
+                 end_date: Optional[str] = None):
         """Run one task or all enabled tasks with explicit range semantics.
 
         Returns a dict result (W2-0.8 缺陷 D/E 修复):
@@ -2169,6 +2197,11 @@ class ResidentCollector:
               staged loads (each target table loaded separately; the final unified
               audit is run by staging Phase 6). A not-yet-loaded sibling target
               table must NOT cause a staged task to appear failed.
+
+        `start_date` / `end_date`（P1，2026-09-29 缺陷1 修复收尾方案 §3.P1）:
+            可选窗口覆盖，仅作用于**本次运行**（execute_task 内 `run_task = dict(task)`
+            已复制，不改持久化配置）。用于把长任务按日期切子窗分轮执行。
+            未传（默认 None）→ 行为与实施前逐位一致（既有 CLI/常驻/GUI 零变化）。
         """
         if mode not in ("full_range", "incremental"):
             raise ValueError(f"unsupported collection mode: {mode!r}")
@@ -2187,6 +2220,16 @@ class ResidentCollector:
                     logger.info(f"[Daemon] skip disabled task: {task['name']}")
                     continue
                 task_found = True
+                # P1：窗口覆盖（仅本次运行；dict() 复制，不动 self.tasks_cfg）
+                if start_date or end_date:
+                    task = dict(task)
+                    if start_date:
+                        task["start_date"] = str(start_date)
+                    if end_date:
+                        task["end_date"] = str(end_date)
+                    logger.info(
+                        f"[Daemon] 窗口覆盖（仅本次运行）: task={task.get('name')} "
+                        f"start_date={task.get('start_date')} end_date={task.get('end_date')}")
                 ok = self.execute_task(task, mode=mode, run_quality_audit=False)
                 if not ok:
                     task_ok = False
@@ -2499,25 +2542,37 @@ class ResidentCollector:
                     chain.append(g)
 
         out: List[str] = []
+        # 工作包 B（2026-09-23 诊断性修复）：逐源跳过原因旁路携带到 ERROR 分支。
+        # 不改本方法签名与返回类型（仍为 List[str]），避免影响 patch.object 注入契约。
+        skip_reasons: List[str] = []
         for src in chain:
             cfg = self.sources_cfg.get("sources", {}).get(src)
             if not cfg or not cfg.get("enabled", False):
+                skip_reasons.append(f"{src}: 未启用")
                 logger.debug(f"[SourceChain] 源 '{src}' 未启用，跳过")
                 continue
             try:
                 adapter = self._get_adapter(src, task)
                 ok, reason = adapter.supports_task(table, freq)
             except Exception as e:
-                logger.debug(f"[SourceChain] 源 '{src}' 适配器不可用: {e}")
+                # 此前仅 DEBUG 留痕 → 真实传输层/构造故障被上报成「无已启用且
+                # 支持的源」，误导排查方向。提升为 WARNING 并带异常摘要
+                # （脱敏：仅异常类型 + 前 200 字符，绝不含凭据）。
+                skip_reasons.append(
+                    f"{src}: 适配器不可用({type(e).__name__}: {str(e)[:200]})")
+                logger.warning(f"[SourceChain] 源 '{src}' 适配器不可用"
+                               f"（{type(e).__name__}: {str(e)[:200]}），按不可用跳过")
                 continue
             if not ok:
+                skip_reasons.append(f"{src}: 不支持 {table}/{freq}({reason})")
                 logger.debug(f"[SourceChain] 源 '{src}' 不支持 {table}/{freq}: {reason}")
                 continue
             out.append(src)
+        self._last_source_chain_skips = skip_reasons
         if len(out) < len(chain):
             skipped = [c for c in chain if c not in out]
             logger.info(f"[SourceChain] task={task.get('name')} 候选链 {chain} → 可用 {out}"
-                        f"（跳过未启用/不支持: {skipped}）")
+                        f"（跳过未启用/不支持: {skipped}；逐源原因: {skip_reasons}）")
         # 警告：如果声明了 authoritative_source 但未出现在可用源链中
         if authoritative and authoritative not in out:
             logger.warning(
@@ -3617,6 +3672,16 @@ def main():
     parser.add_argument("--allow-non-main-target", action="store_true",
                         help="允许写入非主库目标（默认拒绝：目标库必须为主库 data/quantstudio.db）。"
                              "2026-09-13 裁定①：误选 profile 导致数据落 staging 库的同类错误不再靠人工兜底。")
+    # P1（2026-09-29，缺陷1 修复收尾方案 §3.P1）：窗口分段驱动。
+    # 仅 `--mode once` + 显式传入时生效，覆盖**本次运行**的 task start_date/end_date
+    # （execute_task 内 `run_task = dict(task)` 复制，不动持久化配置）。
+    # 用途：长任务（如 stock_minutes 全量 136 批 ≈10h fetch）单次跑不完，
+    # 按日期切子窗分轮执行，使每轮 fetch 有界、可正常跑完并落库。
+    # 不传 = 现状零变化（既有 CLI/常驻/GUI 行为逐位不变）。
+    parser.add_argument("--start-date", default=None, metavar="YYYY-MM-DD",
+                        help="once 模式：覆盖本次运行的窗口起点（full_range 的 start_date）")
+    parser.add_argument("--end-date", default=None, metavar="YYYY-MM-DD",
+                        help="once 模式：覆盖本次运行的窗口终点（full_range 的 end_date）")
     args = parser.parse_args()
 
     # v3 日志：TimedRotatingFileHandler（午夜轮转，保留 14 天）+ 控制台
@@ -3742,7 +3807,8 @@ def main():
                 try:
                     result = collector.run_once(
                         task_name=args.task, mode=args.pull_mode,
-                        quality_audit=args.quality_audit)
+                        quality_audit=args.quality_audit,
+                        start_date=args.start_date, end_date=args.end_date)
                 finally:
                     collector.close()
             # W2-0.8 缺陷 D：CLI 退出码必须反映任务+审计结果，不能总返回 0。

@@ -1,0 +1,125 @@
+# 缺陷1 实施前基线记录（2026-09-27）
+
+- **回退点（stash）**：`6bc04544a1e308c55b56b7b4cc7e053861311026`（`git stash create -u` + `git stash store`，stash@{0}）
+- **误操作找回**：`git reset --hard 6bc04544`
+- **改动目标文件**（实施时**只精确 add 这两个**，绝不 `git add -A`）：
+  - `quantstudio/pipeline/sources/mcp_adapter.py`
+  - `quantstudio/pipeline/quality_audit.py`
+- **不触碰的他人未提交改动**（工作区已有 M，属其他会话）：
+  - `quantstudio/pipeline/daemon.py`
+  - `quantstudio/pipeline/mcp/client.py`
+- **数据库**：`data/quantstudio.db`（DuckDB）、`data/qfq_aux.db`（SQLite）——数据修复阶段须另行备份
+- **方案**：`docs/anchor-drift-fix-design.md`（v3，审计三轮通过）
+- **取证**：`docs/evidence/anchor-drift-forensics-20260926.md`（缺陷1）、
+  `docs/evidence/stock-daily-front-freeze-forensics-20260927.md`（缺陷2）
+
+## 实施纪律（铁律提醒）
+
+1. 只改上述两个文件；提交时精确 add，禁止 `git add -A` / `git add .`。
+2. 每次 edit 后 `git diff <file>` 自检（防并行会话提交覆盖）。
+3. 不推送、不提交到 GitHub（六步流水线未到「用户确认」前）。
+4. 数据修复前先对 `data/` 库做快照备份。
+
+## 代码改动记录（2026-09-27）
+
+- 改动文件：`mcp_adapter.py`（方案 A 判定，149 行）、`quality_audit.py`（补漏检，43 行）
+- 新增测试：`tests/test_restore_to_raw_classify.py`（13 例）、`tests/test_minute_raw_vs_daily.py`（2 例）
+- 测试结果：15 passed；端到端取证真值案例（raw/qfq/ratio≈1/fail）验证通过
+- diff 全文：`docs/handoff/defect1-code-diff-20260927.txt`
+
+## 自查披露的风险点（数据修复前需知悉）
+
+1. **性能（P1-3 未优化）**：`_get_local_daily_close` 在流式每分片 `_restore_to_raw` 内各读一次主库
+   stock_daily（N 分片 = N 次连接+查询）。当前"正确性优先"，方案文档 P1-3 的"参考批量预取挂第二遍"
+   性能优化留待验收阶段（R3 性能项）。数据修复重拉时校验正确性、不计性能。
+2. **日线表自引用**：`_restore_to_raw` 处理 stock_daily 时参考也读 stock_daily。§3.1 已裁定
+   （新日期 ratio≈1 直写不读参考，无死锁；历史重拉用主库旧 close 作参考）。
+3. **参考查询无时间剪枝**：`_get_local_daily_close` 按 code 读全历史 close，未加时间过滤。
+   正确性无碍（返回 map 后按 day 取用），但读量偏大，同属 R3 性能项。
+
+## A 类验收进展（2026-09-27）
+
+### R3 性能门禁（审计第四轮①）——已闭环，剪枝后达标
+
+- 审计①要求：单分片读库 >30s 或内存 >1GB → 时间剪枝必须先行。
+- 实测剪枝前（读 code 全历史）：3000 code = **60.14s**（读 538 万行），远超阈值 → 必须剪枝。
+- 已实施时间剪枝（`_get_local_daily_close` 加 day_min/day_max 参数，读分片日期 ±1 天）：
+
+| code 数 | 剪枝后 | 剪枝前 | 提升 |
+|---|---|---|---|
+| 100 | 0.258s / 99 行 | 2.58s / 20.9 万行 | 10× |
+| 500 | 0.384s / 494 行 | 11.42s / 94.6 万行 | 30× |
+| 1000 | 0.434s / 991 行 | 22.57s / 195 万行 | 52× |
+| 3000 | **0.590s** / 2,972 行 | **60.14s** / 538 万行 | **102×** |
+
+- 剪枝后 3000 code 仅 0.59s、读 2,972 行（内存随之降到可忽略）→ R3 门禁通过。
+- 证明脚本：`agent_workspace/_r3_perf_v2.py`（对比剪枝前后）。
+
+### C1 结论（trade_date 整型）
+
+- 实测生产 stock_daily/etf_daily 全部 212+52 分片 trade_date dtype 均为 `timestamp[ns]`，无整型 → 当前无风险。
+- 已补防御分支（`_bar_day_of` trade_date 整型 YYYYMMDD → astype(str) + format="%Y%m%d"）+ 单测 4 例。
+
+### 单测与回归
+
+- 新增单测 19 例全绿（`test_restore_to_raw_classify.py` 17 + `test_minute_raw_vs_daily.py` 2）。
+- 既有回归 6 例 passed（含 `test_qfq_alignment.py::test_native_adjustment_source_does_not_apply_factor_twice`
+  等 qfq 逻辑）；16 例 error 为 sandbox `tmp_path` 写盘环境限制（setup 阶段 PermissionError，非断言失败，
+  与本次改动无关，需在完整环境补跑）。
+
+## daemon 环境确认（2026-09-27）
+
+- MCP 握手探测：**成功**（server=QuantStudio-MCP，session 有效，initialized=True），云端可达。
+- 探测脚本：`agent_workspace/_probe_handshake.py`。
+- 日常增量路径：`python -m quantstudio.pipeline.daemon --mode forever --config-dir config/profiles/mcp_only`
+  （或 once + task）；A4 检测云端 cloud_updated_log 的 repair/full 窗口触发历史局部重拉，
+  熔断阈值 `_A4_MAX_WINDOWS=20`。
+- ⚠️ 关键不确定：存量 13,309 污染单元格是否被云端标记为 repair/full（决定 A4 是否重拉它们），
+  需跑 daemon 实际观察。
+
+## 数据修复首轮试跑发现（2026-09-27，daemon 已停）
+
+**结果**：修复代码生效，但 `etf_daily` 任务 FAILED，暴露两个问题：
+
+1. **已修复：DuckDB 连接配置冲突**（审计第四轮②实锤）
+   - 现象：`读主库 etf_daily.close 失败: Connection Error: Can't open a connection to same
+     database file with a different configuration`
+   - 根因：`_get_local_daily_close` 用 `read_only=True`，与 daemon writer 的 read-write 连接冲突
+   - 修复：改 `read_only=False`（与 writer 一致；本方法只 SELECT）→ 复测 Connection Error 消失
+
+2. **未决：历史缺日无参考死锁 + 云端复权口径**
+   - 159325 @ 2026-09-11：`ratio=1.999`（除权日 09-14），但本地 etf_daily 缺 09-11 →
+     无参考 → 选项 A fail-fast → **参考永远写不进（死锁）**
+   - 深层：云端 `close` 用最新因子前复权（qfq）、`adj_factor` 用当天因子 → 口径矩阵见
+     `docs/evidence/cloud-caliber-matrix-forensics-20260927.md`
+
+## 远程作者更新合并（2026-09-27）
+
+**背景**：作者向 origin/main 推送新提交（`2b0e269` → `8264273`，30 文件 +3176 行），
+触及我工作区已脏的 `mcp_adapter.py` 与 `mcp/client.py`。
+
+**冲突分析（合并前逐区域核对）**：
+
+| 文件 | 远程改动区域 | 本地改动区域 | 冲突 |
+|---|---|---|---|
+| `mcp_adapter.py` | 缓存/窗口守卫（`_cache_key`/`_export_batches`/`_fetch_export_cached`/`_resolve_shard_paths`） | 我的方案 A 判定（`_restore_to_raw` + 3 辅助函数） | **区域不相交** |
+| `mcp/client.py` | TLS 策略函数” | 他会话 `_session.post` 补 `verify=` | **区域不相交** |
+| `quality_audit.py` | 远程未改 | 我的补漏检 | 无 |
+
+**执行**：合并前快照 `adc3e25f6a381bb156128d9440e13bc476e11a66`（持久化）→
+`git stash push -u` → `git merge origin/main`（**Fast-forward**）→ 恢复全部改动与未跟踪产物。
+**零冲突**。
+
+**验证（合并后）**：
+- 作者新内容在位：`_record_empty_tombstone` / `_tombstone_active` / `_empty_ttl_s` ✓
+- 我的方案 A 在位：`_classify_raw_qfq` / `_get_local_daily_close` / `_bar_day_of` / `classify_judged_raw` ✓
+- 我的补漏检在位：`MinuteRawVsDaily` ✓
+- `py_compile` OK；**19 单测全绿**；取证产物全部恢复
+
+**旁注（重要）**：作者本次更新与我的前期诊断高度互补——
+- 作者 P2-1「空窗墓碑（负缓存）」= 我诊断的 P2-1「export_cache 重取无 shard」修复；
+- 作者 P1-2b「窗口守卫（拒 epoch 退化窗）」= 我诊断的 `ckey=etf_minutes|1970-01-01|1970-01-02` 修复。
+
+**回退点**：`adc3e25f`（合并前完整状态，含我的方案 A）；合并后 HEAD = `8264273`。
+
+

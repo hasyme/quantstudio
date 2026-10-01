@@ -1,0 +1,86 @@
+# 方案 A′ 实施记录（含 §5.3 口径漂移门禁）— 2026-09-28
+
+## 1. 实施范围
+
+| 文件 | 改动 | 说明 |
+|---|---|---|
+| `quantstudio/pipeline/sources/mcp_adapter.py` | +31/-6 | 表级口径：`_QFQ_CALIBER_TABLES = {stock_daily, etf_daily, etf_minutes}` → 还原 raw；`stock_minutes` → 不还原（缺陷1 根修）。删除 v3 逐日判定三函数。 |
+| `quantstudio/pipeline/quality_audit.py` | +301 | §5.3 新增 `_audit_caliber_drift`（CaliberDrift 门禁）+ 5 个阈值常量。 |
+| `tests/test_restore_to_raw_caliber.py` | 新增 | 10 用例（口径矩阵、还原公式、meta 契约）。 |
+| `tests/test_caliber_drift_gate.py` | 新增 | 15 用例（含 4 个真实缺陷回归固化）。 |
+| `tests/test_restore_to_raw_classify.py` | 删除 | v3 逐日判定已废弃。 |
+| `tests/test_minute_raw_vs_daily.py` | 保留 | 补漏检（2 用例）。 |
+
+## 2. 验收结果
+
+- **A′ 相关测试：27/27 PASS**（15 门禁 + 10 还原 + 2 补漏检）
+- `py_compile`：两文件均 OK
+- 真实库端到端：门禁可跑通，`stock_daily` 正确识别为 raw（假阳性已消除）
+
+### 2.1 全量测试套件（环境受限，已归因）
+
+```
+tests=3302  passed=1694  failed=244  errors=1341  skipped=23
+```
+
+**失败归因（junit 逐条统计，证据确凿）**：
+
+| 类别 | 数量 | 占比 | 性质 |
+|---|---|---|---|
+| `PermissionError`（沙箱系统 Temp 被拒） | 1,511 | 95.4% | **环境** |
+| `FileNotFoundError` / `sqlite3.OperationalError`（临时库路径） | 30 | 1.9% | **环境** |
+| fundamentals / design_metadata 断言 | 15 | 0.9% | **既有**（已证与 A′ 无关） |
+| 其余 | ~29 | 1.8% | 环境/既有混合 |
+
+**归因证据**：
+1. 沙箱阻塞系统 Temp（`C:\Users\hasym\AppData\Local\Temp\dsh-*`），
+   pytest `tmp_path` fixture 全线 setup 失败 → 1,315 error + 179 failure；
+2. 将 `daemon.py`/`mcp/client.py`（**其他会话**的在途改动）暂时移出后重跑，
+   计数**完全不变**（1694/244/1341/15）→ 非其所致；
+3. 将**本次 A′ 改动**暂时移出后重跑受影响用例，
+   失败**完全复现**（`EEEEEEEEFFF.FF.FFF.FFFFFFF`）→ **既有失败，与 A′ 无关**；
+4. 15 个真实断言失败全在 fundamentals / metadata 域，
+   **不涉及 QFQ / 口径 / stock_minutes / 本次改动模块**。
+
+> 结论：A′ 未引入任何回归；套件红灯由**沙箱环境**与**既有缺陷**造成。
+
+## 3. §5.3 门禁的实施期重大修正
+
+取证见 `docs/evidence/caliber-drift-gate-forensics-20260928.md`。要点：
+
+1. **本地探测无法区分「云端口径漂移」与「缺陷1 污染未修」**——
+   A′ 对 `stock_minutes` 不还原 → 本地表 = 云端值逐行直写，二者在本地叠加。
+   实测 156 万配对：51.3% 逐位相等、median 比值 0.9993 + 膨胀长尾（p99 1.11/max 18.7）
+   = 污染分布特征，非口径翻转。
+2. **处置**：`_CALIBER_BLOCK_STOCK_MINUTES = False`（默认）→ 只告警不阻断，
+   detail 如实标注；**数据修复验收通过后置 `True`** 恢复 §5.3 阻断语义。
+   双态由测试双向固化（阻断/告警各一用例）。
+3. **ETF 两表结构性不可探**（实测最大除权步进 1.925% < 2% 阈值），
+   已如实分类为 `CaliberDriftNotProbeable`，口径交 §5.2 一致率兜底。
+
+## 4. 实施中修复的 4 个实质缺陷（全部固化回归用例）
+
+| # | 缺陷 | 后果 | 修复 |
+|---|---|---|---|
+| ① | 因子分割点误用 `ex-2d` | 2,070/2,441 code 误判「无步进」 | 分割点取 `ex_ms` |
+| ② | bar 时刻过滤一表通吃 | 三张日线/ETF 表 **0 探针**（静默失效） | 按表选用时刻（分钟 15:00 CST / 日线 00:00 CST） |
+| ③ | 探针取「窗口内最后两日」 | `stock_daily` 被误判 51% qfq | 严格「除权日 vs 前一交易日」+ CST 日对齐 |
+| ④ | `gap≥2%` 阈值 | ETF 表结构性 0 探针却报「样本不足」 | 新增 `CaliberDriftNotProbeable` 如实分类 |
+
+## 5. 回退点
+
+| 用途 | Hash |
+|---|---|
+| A′ 实施前 | `acdafb7d3f8fa77068f9a03116771e1900e5b1a7` |
+| 合并前 | `adc3e25f` |
+| v3 实施前 | `6bc04544` |
+| 本轮隔离测试前 | `34b7378794e9d55878dfb5af7ec22190b86f3233` |
+
+## 6. 未完成 / 后续
+
+1. **数据修复**：重跑 daemon 日增量，复位 `stock_minutes` 13,309 + `etf_minutes` 1,327 单元格。
+2. **门禁开关启用**：数据修复验收通过后置 `_CALIBER_BLOCK_STOCK_MINUTES = True`。
+3. **§5.2 结果导向验收**：close 一致率 ≥99.5%、受影响单元格 100% 复位、
+   `AdjustmentAnchorDrift` → 0、6 策略横验证。
+4. **用户确认 → 双仓库推送**（六步流水线第 5-6 步）。
+5. 缺陷 2（`stock_daily.close_front` 冻结，430 codes / 54,442 rows）独立立项。

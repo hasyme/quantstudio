@@ -208,6 +208,8 @@ class DataQualityAuditor:
             self._audit_minute_anchor_drift(conn, report, tables)
             # A2：因子序列非单调告警（同上）
             self._audit_factor_monotonicity(conn, report)
+            # A3（缺陷1 方案 A′ §5.3）：云端口径漂移门禁
+            self._audit_caliber_drift(conn, report, tables)
         finally:
             if own_conn is not None:
                 own_conn.close()
@@ -564,6 +566,18 @@ class DataQualityAuditor:
     _DRIFT_LOOKBACK_DAYS = 90
     _BAR_CLOSE_MS_LO = 6 * 3600_000 + 59 * 60_000      # 06:59 UTC（14:59 CST）
     _BAR_CLOSE_MS_HI = 7 * 3600_000 + 1 * 60_000       # 07:01 UTC（15:01 CST）
+    _DAILY_BAR_MS = 16 * 3600_000                      # 00:00 CST（日线 bar 时刻约定）
+
+    # A3（方案 A′ §5.3）口径漂移门禁参数（未决项 §7-3 「实施时定」）：
+    _CALIBER_MIN_DIV_GAP = 0.02        # 除权日落差 <2% 的探针不可分辨 → 弃用
+    _CALIBER_DECISIVE_MARGIN = 0.5     # 实测比值须落在某假设 0.5×gap 容差内才计票
+    _CALIBER_MIN_PROBES = 20           # 少于此探针数 → 样本不足告警（口径未决）
+    _CALIBER_MAJORITY = 0.5            # 表级多数票须 >50% 方定口径
+    # §5.3 阻断开关：stock_minutes 口径翻转是否阻断。默认关（False）——取证证明
+    # 修复前「缺陷1 污染」与「云端口径漂移」在本地表不可区分，阻断会常亮误报。
+    # 数据修复验收通过后置 True 恢复阻断语义。
+    # 见 docs/evidence/caliber-drift-gate-forensics-20260928.md §4。
+    _CALIBER_BLOCK_STOCK_MINUTES = False
 
     def _resolve_aux_path(self, conn) -> Optional[Path]:
         """解析因子库路径（跟随运行时路由，ZCode 执行注记 2）。
@@ -704,6 +718,302 @@ class DataQualityAuditor:
             if len(warns):
                 self._add(report, "AdjustmentAnchorDrift", minute_tbl, len(warns), "warning",
                           f"WARN 0.3-0.5%: {sorted(warns.index)[:10]}")
+
+            # === 补漏检（缺陷1，2026-09-27）：minutes.close 对日线 close 独立校验 ===
+            # A1 只验 close_front/close 的「互自洽」，两列同向偏移（如 600649 落库 close=57.13
+            # vs 真值 3.50，+1532%）时比值仍对 → 漏检。此处直接比对 minutes.close 对日线 close，
+            # 覆盖同向偏移。候选与采样 bar 口径与 A1 一致（除权候选 × 14:59~15:01 收盘 bar）。
+            import datetime as _dt
+            _CST = _dt.timezone(_dt.timedelta(hours=8))
+            _day_s = (pd.to_datetime(merged["time"], unit="ms")
+                      .dt.tz_localize("UTC").dt.tz_convert("Asia/Shanghai")
+                      .dt.strftime("%Y-%m-%d"))
+            merged["_day"] = _day_s
+            _daily_tbl = "etf_daily" if minute_tbl == "etf_minutes" else "stock_daily"
+            try:
+                _daily_rows = conn.execute(
+                    f"SELECT code, time, close FROM {_daily_tbl} "
+                    f"WHERE code IN ({placeholders}) AND time >= ? AND time < ?",
+                    codes + [w_lo - 86_400_000, w_hi + 86_400_000]).fetchall()
+            except Exception:
+                continue
+            if _daily_rows:
+                _ddf = pd.DataFrame(_daily_rows, columns=["code", "time", "close"])
+                _ddf["_day"] = (pd.to_datetime(_ddf["time"], unit="ms")
+                                .dt.tz_localize("UTC").dt.tz_convert("Asia/Shanghai")
+                                .dt.strftime("%Y-%m-%d"))
+                _ddf = _ddf.rename(columns={"close": "daily_close"})
+                _m2 = merged.merge(_ddf[["code", "_day", "daily_close"]],
+                                   on=["code", "_day"], how="left")
+                _m2 = _m2.dropna(subset=["daily_close"])
+                if len(_m2):
+                    _m2["raw_dev"] = (_m2["close"] / _m2["daily_close"] - 1).abs()
+                    _per_raw = _m2.groupby("code")["raw_dev"].max()
+                    _raw_fails = _per_raw[_per_raw > self._ANCHOR_DRIFT_FAIL]
+                    _raw_warns = _per_raw[(_per_raw > self._ANCHOR_DRIFT_WARN)
+                                          & (_per_raw <= self._ANCHOR_DRIFT_FAIL)]
+                    if len(_raw_fails):
+                        self._add(report, "MinuteRawVsDaily", minute_tbl, len(_raw_fails),
+                                  "error",
+                                  f"FAIL>0.5%: {sorted(_raw_fails.index)[:10]} "
+                                  f"(max={_per_raw.max():.4f})")
+                    if len(_raw_warns):
+                        self._add(report, "MinuteRawVsDaily", minute_tbl, len(_raw_warns),
+                                  "warning",
+                                  f"WARN 0.3-0.5%: {sorted(_raw_warns.index)[:10]}")
+
+    def _audit_caliber_drift(self, conn, report, tables):
+        """A3（缺陷1 方案 A′ §5.3）：云端口径漂移门禁（CaliberDrift）。
+
+        背景：A′ 是**表级硬编码**口径方案（`_QFQ_CALIBER_TABLES = {stock_daily,
+        etf_daily, etf_minutes}` → 还原 raw；`stock_minutes` → 不还原）。口径一旦
+        漂移即**静默写错**（无异常无日志），故设本门禁做回归探测。
+
+        > 口径矩阵（2026-09-27）**已由金标准方法再确认正确**（2026-09-30）：
+        > 用 `amount/volume` 反推真实成交价（**与复权无关**）复核——
+        > `stock_daily` err_qfq 比 err_raw 小 32×、`etf_daily` 小 75× → 均 qfq；
+        > `stock_minutes` `close/(amount/volume)=1.0000` → raw。
+        > 2026-09-30 曾有一次基于「云端 stock_minutes 作基准」的收缩复核，
+        > 因**同型循环论证**（该表 raw 判定本身来自原矩阵）而错误，已回退。
+        > 详见 `docs/evidence/caliber-recheck-gold-standard-20260930.md`。
+        > 门禁**逻辑零改动**——四张本地表**还原后均期望 raw**，故期望矩阵不变。
+
+        判别原理（N1 取证法推广，与 A1 同为「外参比」而非「自洽」）：
+        除权日 D 处，令 k = adj_D/adj_{D-1} > 1（来自 qfq_aux.db 因子表，**独立于
+        被测输出**），实测本表 close 的跨除权日比值 r = close_D/close_{D-1}：
+          · r ≈ 1    → 输出为 qfq（未还原）
+          · r ≈ 1/k  → 输出为 raw（已还原，A′ 预期态）
+          · r ≈ 1/k² → **双重复权**（云端已 raw 而管线又还原一次）
+        取「k 步长足够大」（1-1/k ≥ 2%）的探针，避免真实涨跌幅淹没信号；单探针须
+        落在某假设的 0.5×gap 容差内才计票，再按**表级多数票**定口径（聚合抗噪，
+        与取证 107/107 同法）。
+
+        判级（§5.3）：
+          · `stock_minutes` 口径翻转（raw→qfq）→ **error/阻断**（N5）——
+            A′ 对该表不还原，云端若改返 qfq 将直接写入未还原值 = 缺陷1 回归；
+          · 日线表 / `etf_minutes` 口径不符 → **warning**（影响面为还原值偏差，
+            由 §5.2 结果导向一致率兜底）。
+
+        局限（如实声明）：参照系为 qfq_aux.db 因子表——本门禁探测**云端口径漂移**，
+        不覆盖因子表自身的世代污染（另有 FactorMonotonicity / A1 覆盖）。
+        """
+        import pandas as pd
+
+        if "stock_minutes" not in tables and "stock_daily" not in tables \
+                and "etf_daily" not in tables and "etf_minutes" not in tables:
+            return
+        aux_path = self._resolve_aux_path(conn)
+        if aux_path is None:
+            self._add(report, "CaliberDriftAuxUnavailable", "__qfq__", 1, "warning",
+                      "因子库不可用（override 缺失或路由解析失败），口径漂移门禁跳过")
+            return
+
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        lo = int((now - timedelta(days=self._DIV_WINDOW_BACK_DAYS)).timestamp() * 1000)
+        hi = int((now + timedelta(days=self._DIV_WINDOW_FWD_DAYS)).timestamp() * 1000)
+
+        for tbl, div_tbl, factor_tbl, is_blocking in (
+                ("stock_minutes", "stock_dividend", "adj_factor", True),
+                ("stock_daily", "stock_dividend", "adj_factor", False),
+                ("etf_daily", "etf_dividend", "fund_adj", False),
+                ("etf_minutes", "etf_dividend", "fund_adj", False)):
+            if tbl not in tables or div_tbl not in tables:
+                continue
+            try:
+                rows = conn.execute(
+                    f"SELECT DISTINCT code, ex_date FROM {div_tbl} "
+                    "WHERE ex_date BETWEEN ? AND ? AND code IS NOT NULL",
+                    [lo, hi]).fetchall()
+            except Exception:
+                continue  # 除权表结构异常 → 跳过（不阻断其余审计）
+            if not rows:
+                continue
+            ex_by_code: dict = {}
+            for c, d in rows:
+                try:
+                    ex_by_code.setdefault(str(c), set()).add(int(d))
+                except (TypeError, ValueError):
+                    continue
+            if not ex_by_code:
+                continue
+            codes = sorted(ex_by_code)
+            factors = self._read_factor_table(aux_path, factor_tbl, codes)
+            if not factors:
+                self._add(report, "CaliberDriftFactorMissing", factor_tbl, len(codes),
+                          "warning", f"探针候选 {len(codes)} code 无因子数据")
+                continue
+
+            votes = {"qfq": 0, "raw": 0, "double": 0}
+            unclassified = 0
+            probes = 0
+            samples = 0
+            specs: list = []
+            offenders = {"qfq": [], "double": []}
+
+            # 因子按 code 建索引一次（原按 code 线性扫全表为 O(n·m)，大表下不可接受）
+            fby: dict = {}
+            for c, t, v in factors:
+                if v is None:
+                    continue
+                try:
+                    fby.setdefault(str(c), []).append((int(t), float(v)))
+                except (TypeError, ValueError):
+                    continue
+            for seq in fby.values():
+                seq.sort()
+
+            for code, ex_days in ex_by_code.items():
+                f = fby.get(code)
+                if not f or len(f) < 2:
+                    continue
+                for ex_ms in ex_days:
+                    # 因子步进**恰在除权日**（实测：600812 ex=2026-06-11 step@2026-06-11
+                    # 4.0577→4.0856；600602 ex=2026-07-28 step@2026-07-28）。
+                    # 故分割点必须取 ex_ms 本身：before = 严格早于除权日的最后一个因子，
+                    # after = 除权日及之后的第一个因子。
+                    # ⚠ 早期版本误用 ex_ms-2d 作分割点——当步进落在除权日当天时，
+                    # before 已含步进后的值 → a1<=a0 → 2070/2441 code 误判「无步进」。
+                    before = [v for t, v in f if t < ex_ms]
+                    after = [v for t, v in f if t >= ex_ms]
+                    if not before or not after:
+                        continue
+                    a0, a1 = before[-1], after[0]
+                    if a0 <= 0 or a1 <= a0:
+                        continue
+                    k = a1 / a0
+                    gap = 1.0 - 1.0 / k          # raw 相对 qfq 的跨除权日落差
+                    if gap < self._CALIBER_MIN_DIV_GAP:
+                        continue                 # 分红过小 → 探针不可分辨，弃用
+                    # 除权日前后各容 4/3 天（覆盖周末/停牌），只记探针规格，
+                    # bar 数据留待下一步**单次批量查询**取（逐 code 查询实测 0.5s/探针，
+                    # 2441 候选 code 下需 ~20 分钟 → 必须批量）
+                    specs.append((code, k, gap, ex_ms - 4 * 86400_000,
+                                  ex_ms + 3 * 86400_000,
+                                  (ex_ms + 8 * 3600_000) // 86400_000))
+
+            if not specs:
+                # 区分「样本不足」与「结构性不可探」：ETF 分红实测最大 gap 仅 1.925%
+                # （80 条 etf_dividend 全量），永远达不到 2% 可分辨门槛；即便降到 0.5%
+                # 也只有 23 探针且票型三分（10 raw/5 double/8 qfq），无统计意义。
+                # 如实报告「不可探」而非让「样本不足」长期误导运维。
+                if div_tbl == "etf_dividend":
+                    self._add(report, "CaliberDriftNotProbeable", tbl, max(len(codes), 1),
+                              "warning",
+                              f"候选 {len(codes)} code 无探针：ETF 分红过小"
+                              f"（实测最大除权步进 1.93% < {self._CALIBER_MIN_DIV_GAP:.0%} 阈值），"
+                              f"本方法对该表结构性不可探 → 口径改由 §5.2 结果导向一致率兜底")
+                else:
+                    self._add(report, "CaliberDriftInsufficientSample", tbl,
+                              max(len(codes), 1), "warning",
+                              f"可用探针 0 < {self._CALIBER_MIN_PROBES}"
+                              f"（候选 {len(codes)} code，无 ≥"
+                              f"{self._CALIBER_MIN_DIV_GAP:.0%} 除权步进可分辨），"
+                              f"口径未决，请人工复核该表云端口径")
+                continue
+
+            # === 单次批量取 bar：所有探针窗口合并为一次查询（口径漂移门禁性能关键）===
+            # 各表 bar 时刻约定不同（实测）：分钟表收盘 bar = 14:59-15:01 CST
+            # （= 06:59-07:01 UTC → ms%86400000 ∈ [25140000, 25260000]）；
+            # 日线表整根 bar 戳在 **00:00 CST**（ms%86400000 == 57600000）。
+            # ⚠ 早期版本对四表统一用分钟收盘时刻过滤 → 三张日线/ETF 表 0 探针。
+            if tbl.endswith("_minutes"):
+                tod_lo, tod_hi = self._BAR_CLOSE_MS_LO, self._BAR_CLOSE_MS_HI
+            else:
+                tod_lo = tod_hi = self._DAILY_BAR_MS
+            win_lo = min(s[3] for s in specs)
+            win_hi = max(s[4] for s in specs)
+            probe_codes = sorted({s[0] for s in specs})
+            bars_by_code: dict = {}
+            try:
+                cur = conn.execute(
+                    f"SELECT code, time, close FROM {tbl} "
+                    f"WHERE code IN ({','.join('?' * len(probe_codes))}) "
+                    "AND time >= ? AND time < ? AND close > 0 "
+                    "AND (time % 86400000) BETWEEN ? AND ?",
+                    probe_codes + [win_lo, win_hi, tod_lo, tod_hi])
+                for _c, t, cl in cur.fetchall():
+                    bars_by_code.setdefault(str(_c), []).append((int(t), float(cl)))
+            except Exception:
+                bars_by_code = {}
+            for seq in bars_by_code.values():
+                seq.sort()
+
+            for code, k, gap, p_lo, p_hi, ex_day in specs:
+                bars = [b for b in bars_by_code.get(code, []) if p_lo <= b[0] < p_hi]
+                if len(bars) < 2:
+                    continue
+                samples += len(bars)
+                day_close: dict = {}
+                for t, cl in bars:
+                    # 归一到 **CST 自然日**（+8h 后再整除）：
+                    # 日线 bar 00:00 CST 与分钟收盘 bar 15:00 CST 同属该 CST 日，
+                    # 但二者 UTC 日桶不同（00:00 CST = 前一日 16:00 UTC），
+                    # 故必须用 CST 日对齐，否则 ex_day 匹配失败。
+                    day_close[(t + 8 * 3600_000) // 86400_000] = cl
+                # === 严格探针：必须取「除权日当天」对「其前一交易日」===
+                # ⚠ 早期版本取「窗口内最后两个不同日」，当窗口内无除权日 bar 时
+                # 会跨到除权日之后的区间，步进已被两端吸收 → r≈1 假判 qfq
+                # （实测：stock_daily 由正确的 raw 被误判为 51.0% qfq）。
+                if ex_day not in day_close:
+                    continue                     # 除权日无 bar → 该探针不可用
+                prior = [d for d in day_close if d < ex_day]
+                if not prior:
+                    continue
+                c1 = day_close[ex_day]
+                c0 = day_close[max(prior)]       # 除权日之前最近一个交易日
+                if c0 <= 0 or c1 <= 0:
+                    continue
+                r = c1 / c0
+                probes += 1
+                hyp = {"qfq": 1.0, "raw": 1.0 / k, "double": 1.0 / (k * k)}
+                tol = self._CALIBER_DECISIVE_MARGIN * gap
+                best = min(hyp, key=lambda h: abs(r - hyp[h]))
+                if abs(r - hyp[best]) > tol:
+                    unclassified += 1   # 真实涨跌幅等噪声 → 不计票
+                    continue
+                votes[best] += 1
+                if best != "raw":
+                    offenders[best].append(f"{code}@{ex_day}")
+
+            if probes < self._CALIBER_MIN_PROBES:
+                # count 传候选 code 数（非 probes）——probes 可能为 0，而 _add 对
+                # count=0 静默跳过，会使「全无可用探针」这一真实风险隐形。
+                self._add(report, "CaliberDriftInsufficientSample", tbl, max(len(codes), 1),
+                          "warning",
+                          f"可用探针 {probes} < {self._CALIBER_MIN_PROBES}"
+                          f"（候选 {len(codes)} code，除权样本不足或分红 <2% 不可分辨），"
+                          f"口径未决，请人工复核该表云端口径")
+                continue
+
+            decided = max(votes, key=lambda h: votes[h])
+            share = votes[decided] / probes
+            if decided == "raw" or share <= self._CALIBER_MAJORITY:
+                if share <= self._CALIBER_MAJORITY:
+                    self._add(report, "CaliberDriftInconclusive", tbl, probes, "warning",
+                              f"多数票 {share:.1%} 未过半（{votes}，探针 {probes}），"
+                              f"口径未决; unclassified={unclassified}")
+                continue
+
+            # === 阻断档位（§5.3 设计意图 vs 实测可辨识性）===
+            # 取证结论（docs/evidence/caliber-drift-gate-forensics-20260928.md §3-§4）：
+            # 本门禁探的是**本地表**口径，而 stock_minutes 本地值 = 云端值逐行直写
+            # （A′ 对该表不还原），故「云端改返 qfq」与「缺陷1 历史污染未修复」在本地
+            # 叠加、不可分离。实测 median(minute/daily close) ≈ 0.999（主体 raw）+ 膨胀
+            # 长尾（p99 1.11 / max 18.7）= 未修复污染的分布特征，非口径翻转。
+            # 因此默认**只告警不阻断**，避免修复前后常亮误报（违背纯增益）；
+            # 待数据修复验收通过后，将 _CALIBER_BLOCK_STOCK_MINUTES 置 True 恢复
+            # §5.3 的阻断语义（届时本地应为纯 raw，翻转即真回归）。
+            sev = "error" if (is_blocking and self._CALIBER_BLOCK_STOCK_MINUTES) else "warning"
+            detail = (f"实测 {decided}（票 {votes[decided]}/{probes}"
+                      f"={share:.1%}，期望 raw），sample={offenders[decided][:10]}")
+            if is_blocking and decided == "qfq":
+                if self._CALIBER_BLOCK_STOCK_MINUTES:
+                    detail += "；stock_minutes 翻转 = 缺陷1 直接回归（A′ 对该表不还原），阻断"
+                else:
+                    detail += ("；stock_minutes 非 raw = 缺陷1 污染与口径漂移本地不可区分，"
+                               "待数据修复验收后启用阻断（_CALIBER_BLOCK_STOCK_MINUTES）")
+            self._add(report, "CaliberDrift", tbl, votes[decided], sev, detail)
 
     def _clean_factor_segments(self, fdf: pd.DataFrame) -> pd.DataFrame:
         """同值段合并 + 污染尖刺剔除。

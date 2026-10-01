@@ -1,0 +1,7 @@
+all factor-change samples: 57583
+
+amp          n        err_raw      err_qfq      verdict
+0.2-1pct     117      0.01260      0.01154      QFQ
+1-3pct       51       0.01471      0.01114      QFQ
+3-10pct      17       0.04024      0.01821      QFQ
+gt10pct      26       0.55765      0.04852      QFQ

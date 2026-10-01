@@ -1,0 +1,67 @@
+=== stock_minutes schema ===
+  code                 VARCHAR
+  time                 BIGINT
+  freq                 VARCHAR
+  open                 DOUBLE
+  high                 DOUBLE
+  low                  DOUBLE
+  close                DOUBLE
+  volume               DOUBLE
+  amount               DOUBLE
+  preClose             DOUBLE
+  suspendFlag          INTEGER
+  settelementPrice     DOUBLE
+  openInterest         DOUBLE
+  open_front           DOUBLE
+  high_front           DOUBLE
+  low_front            DOUBLE
+  close_front          DOUBLE
+  open_back            DOUBLE
+  high_back            DOUBLE
+  low_back             DOUBLE
+  close_back           DOUBLE
+  open_front_ratio     DOUBLE
+  high_front_ratio     DOUBLE
+  low_front_ratio      DOUBLE
+  close_front_ratio    DOUBLE
+  open_back_ratio      DOUBLE
+  high_back_ratio      DOUBLE
+  low_back_ratio       DOUBLE
+  close_back_ratio     DOUBLE
+  dividend_type        VARCHAR
+  update_time          VARCHAR
+  data_source          VARCHAR
+
+=== 行数 ===
+  stock_minutes           194,994,044
+  etf_minutes             132,406,982
+  stock_dividend               54,023
+  etf_dividend                    882
+
+=== 000012 在 stock_minutes 的行数 / 时间跨度 ===
+  rows=38,381  min=1767576600000  max=1789542000000
+
+=== stock_dividend schema + 000012 除权记录 ===
+  code                 VARCHAR
+  ex_date              BIGINT
+  record_date          BIGINT
+  ann_date             BIGINT
+  end_date             BIGINT
+  cash_div_before_tax  DOUBLE
+  cash_div_after_tax   DOUBLE
+  cash_div             DOUBLE
+  stk_div              DOUBLE
+  stk_bo_rate          DOUBLE
+  stk_co_rate          DOUBLE
+  div_rat              DOUBLE
+  div_proc             VARCHAR
+  update_time          VARCHAR
+  data_source          VARCHAR
+  ('000012', 1784736000000, 1784649600000, 1782489600000, 1767110400000, 0.02, 0.02, None, 0.0, None, None, None, '实施', '2026-08-16 03:28:28', 'mcp')
+  ('000012', 1753200000000, 1753113600000, 1750780800000, 1735574400000, 0.07, 0.07, None, 0.0, None, None, None, '实施', '2026-08-16 03:28:28', 'mcp')
+  ('000012', 1721059200000, 1720972800000, 1718899200000, 1703952000000, 0.25, 0.25, None, 0.0, None, None, None, '实施', '2026-08-16 03:28:28', 'mcp')
+  ('000012', 1689264000000, 1689177600000, 1687968000000, 1672416000000, 0.15, 0.15, None, 0.0, None, None, None, '实施', '2026-08-16 03:28:28', 'mcp')
+  ('000012', 1656000000000, 1655913600000, 1652716800000, 1640880000000, 0.2, 0.2, None, 0.0, None, None, None, '实施', '2026-08-16 03:28:28', 'mcp')
+  ('000012', 1623859200000, 1623772800000, 1620403200000, 1609344000000, 0.1, 0.1, None, 0.0, None, None, None, '实施', '2026-08-16 03:28:28', 'mcp')
+  ('000012', 1593532800000, 1593446400000, 1590076800000, 1577721600000, 0.07, 0.07, None, 0.0, None, None, None, '实施', '2026-08-16 03:28:28', 'mcp')
+  ('000012', 1561478400000, 1561392000000, 1557417600000, 1546185600000, 0.05, 0.05, None, 0.1, None, 0.1, None, '实施', '2026-08-16 03:28:28', 'mcp')

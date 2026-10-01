@@ -1,0 +1,8 @@
+pairs=5188
+local_minutes / cloud_minutes_raw:
+  median=1.000000  ==1:66.3%  >1.05:0.1%  <0.95:0.0%
+
+update_time 分布:
+upd
+2026-09-30    5183
+2026-09-07       5

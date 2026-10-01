@@ -421,6 +421,12 @@ class QFQOrchestratorConfig:
     quality_thresholds: Dict = field(default_factory=dict)
     bootstrap_batch_size: int = 50
     bootstrap_max_parallel: int = 8
+    # P2②（2026-09-29，缺陷1 修复收尾方案 §3.P2）：逐股重锚链（applying 相位）的
+    # 运行预算（秒）。默认 1800（30 min）；**0/负 = 不限**（回退旧行为）。
+    # 背景：该链此前无任何边界——2026-09-28 事故中实测 47 只/5 小时（约 6.4 min/只），
+    # 全市场 5,247 只 ≈ 数周量级。预算到点即「本轮截断、下轮续做」
+    # （units 来自 qfq_trigger_queue 持久化 pending，下轮 recover_pending_due 回收）。
+    apply_budget_sec: int = 1800
     raw: Dict = field(default_factory=dict)
 
     # —— 四张协调价格表（启用编排器时其水位延迟提交）——
@@ -481,6 +487,7 @@ class QFQOrchestratorConfig:
             quality_thresholds=dict(qt),
             bootstrap_batch_size=int(bs.get("batch_size", 50)),
             bootstrap_max_parallel=int(bs.get("max_parallel_securities", 8)),
+            apply_budget_sec=int(cfg.get("apply_budget_sec", 1800)),
             raw=dict(cfg),
         )
         obj.validate()

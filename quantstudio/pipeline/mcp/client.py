@@ -389,9 +389,18 @@ class MCPClient:
         headers = self._build_headers()
         logger.debug(f"[MCP rpc] {method} id={rid} headers={_mask_headers(headers)}")
         try:
+            # TLS 契约（2026-09-23 修复）：**必须请求级显式传 verify**。
+            # 仅设 _session.verify 不足——请求级 verify 为 None 时，requests 的
+            # merge_environment_settings 优先采用环境变量 REQUESTS_CA_BUNDLE /
+            # CURL_CA_BUNDLE（sessions.py:769-774），且 merge_setting 对非 Mapping
+            # 直接返回请求级结果 → session 级 verify=False 被静默覆盖成 CA bundle，
+            # 导致自签证书的开发 IP（tls_verify=false）握手必然失败。请求级传值后：
+            # tls_verify=false 跳过 env 分支（即配置本意）；tls_verify=true 与旧路径
+            # 同落 env 分支，CA bundle 解析结果逐项一致（等价性见方案 §5）。
             resp = self._session.post(
                 self.endpoint, headers=headers, json=body,
                 timeout=self.call_timeout, stream=True,
+                verify=self.tls_verify,
             )
         except requests.RequestException as e:
             raise MCPTransportError(f"{method} 网络失败: {type(e).__name__}: {e}") from e

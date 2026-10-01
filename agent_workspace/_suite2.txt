@@ -1,0 +1,102 @@
+﻿EEE................EEE......E........................EE...........EEEEEE [  2%]
+EEEEEEEEEEEE..EEEEE..EE.......EEEEEEEE....F..FFFFFFFFFFF.....EEE.....FF. [  4%]
+F.........................................EE............................ [  6%]
+...........EEE.FFFFFFFFFFFFF.EEEEEEE............EEEEEEEEEEE.....EEEE.EE. [  8%]
+........F.F..EEE.EEEEEEE........EEEEEEEEEEEE............................ [ 10%]
+......................EEEEE.EEEEE..........................EEEEEEEEEEEEE [ 13%]
+EEEEEEEEEEEEEEEE.................EEEEEEEEFFF...EEEEEEEEEEEEEEE.EEEEEEEEE [ 15%]
+........EEE..........................................EE.......E........E [ 17%]
+......................E...............EE.EEEEEEEEEEEEEEEE....EEE.....EEE [ 19%]
+EEE.EEEEEEEE...................EEEEEEEEEEEEEEEEEE....................E.. [ 21%]
+......................FFFFFFFFFFFFFFFFFFF...FFFFFFFFFFFFFFFFFFFFFFFFFFFF [ 24%]
+FFFFFFFFFFFFFFF......EEEEEEEEEEEEEEEEEEEE..EEEE.E..FF.FFF.FF............ [ 26%]
+....FFFFF..................................EEEEEEEEEEEEEEEEEEE.EEEEEEEEE [ 28%]
+EEEEEEE.....EEEE......EEEEEE.EEEEEE........EEEEEEEEEEEEEEEEEEE.........E [ 30%]
+EEEEEEE...EEEEEEEEEE.EEE......................FF..F...E........EEEEEEE.E [ 32%]
+EEEEEEEEEEEEE.EEEEE...EEEEEEEEEEEEEE...........EEEEEE..EEEEEEEEEEEEEEEEE [ 35%]
+EEEEEEEEEEEEEEEEEEEEEEEEEEEEEFEEEEEEEE................EEEEEEEEEEEEEE.... [ 37%]
+..EE..........EEEEEEEEEEEEEE.EEE..........EEE.............F..EE..EEEEE.E [ 39%]
+EE..EEEEE........E..EEs......EE.E.EEEE.EE...............EEEEEEEEEEEEE.EE [ 41%]
+EEE........EEEEEE.EEEE.EEEEEEEEE..E..............E..EEEEEEEEEEE.......F. [ 43%]
+..............EEE......................FFF.................F............ [ 45%]
+......EEEEEEEEEEEEEEEEEEEEEEEEEEEE............................F......... [ 48%]
+...............................................................EEEEEEEE. [ 50%]
+EEEE...................EEEEEEEE...........EEE........................... [ 52%]
+..................EEEEEEE.......................s.....F....E............ [ 54%]
+...........E.....................sssssssssFFFFFFFFFFFFFFFF...F.....s.FF. [ 56%]
+....FFF.....................FF.......FF.........FFF............F........ [ 59%]
+........................E........EE..................F......EF.......EEE [ 61%]
+EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE..EE.EE.EEEEE......EE..EEEEEEEEE.EEEEEEE [ 63%]
+EEEEEEEEEEEEEEEEEEEE.EE......EEEEEEEEE.......EEEEEEEEEEEEEEEEEEEEEEEEEEE [ 65%]
+E....EEEEE.EEEEEEEEEEEEE....EEEEEEEEEEEE..EEEEEEEEEEEEEEEEE.....EE.E..EE [ 67%]
+EE.....E..EEEE..E.E.........................EEEE....EEE..........E..E... [ 70%]
+EEEE...EEEEEEEEEEEEEEE.....................................ss........... [ 72%]
+.....F.........EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE.EEEEEEEEEEEEEEEEEEEEE [ 74%]
+EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE.EEEEEEEEEEEEEEEEEEEEEEE [ 76%]
+EEEEEE..EEEEEEEEEEEEEEEEEEEEEEEEE.EEEEEEEEE.EEEEEEE...FE.FEFEFEFEFEFEFEF [ 78%]
+EFEFEFEFEFE...................EEEEEEEEEEEEEEEEEEE...EEEEEEEEEEEEEEEEEEEE [ 80%]
+EEEEEEEEE....EEE.EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE.EEEEE.....EEEEEEEEE [ 82%]
+EEEEEEEEEEEEEEEEEEEEEEEEE........E..EEEEEEEEEE..E.E..EE..E.............E [ 84%]
+EEEEEEEEEEEEEEEEEEEEEEEEEEEEEE.........F......................EE........ [ 87%]
+..........EEEE..................EEEEEEEEEEEEEEEEEEEEEEE..FEEEEEEEEEFFFFF [ 89%]
+FFFFFFFFFFFEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE...............FF..FFFFFFFF [ 91%]
+EEEEEEEEFFF.FFFFFFFFFFFFFFFFFFFFFF.FF.FFFFF.FFFFFF........EEEEEEFFFFFFEE [ 93%]
+......EEEE.E.FFFFF....................EEEEEEE.....EEF............EEEEEEE [ 95%]
+EEEEEEE.....E.................EEEEEEE.EEEEEEEEEEExxxxEEEEEEExxxxEEE..... [ 98%]
+python.exe : Traceback (most recent call last):
+At line:1 char:358
++ ... \_locktmp"; & "C:\Users\hasym\.conda\envs\quant310\python.exe" -m pyt ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "C:\Users\hasym\.conda\envs\quant310\lib\runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "C:\Users\hasym\.conda\envs\quant310\lib\runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pytest\__main__.py", line 9, in <module>
+    raise SystemExit(_console_main())
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\config\__init__.py", line 253, in _console_main
+    code = _main(prog=_get_prog_name(sys.argv))
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\config\__init__.py", line 229, in _main
+    ret: ExitCode | int = config.hook.pytest_cmdline_main(config=config)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_hooks.py", line 512, in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_manager.py", line 120, in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py", line 167, in _multicall
+    raise exception
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py", line 121, in _multicall
+    res = hook_impl.function(*args)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\main.py", line 377, in pytest_cmdline_main
+    return wrap_session(config, _main)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\main.py", line 365, in wrap_session
+    config.hook.pytest_sessionfinish(
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_hooks.py", line 512, in __call__
+    return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_manager.py", line 120, in _hookexec
+    return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py", line 167, in _multicall
+    raise exception
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py", line 139, in _multicall
+    teardown.throw(exception)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\logging.py", line 888, in pytest_sessionfinish
+    return (yield)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py", line 139, in _multicall
+    teardown.throw(exception)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\terminal.py", line 961, in pytest_sessionfinish
+    result = yield
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py", line 139, in _multicall
+    teardown.throw(exception)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\warnings.py", line 119, in pytest_sessionfinish
+    return (yield)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\pluggy\_callers.py", line 121, in _multicall
+    res = hook_impl.function(*args)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\tmpdir.py", line 337, in pytest_sessionfinish
+    cleanup_dead_symlinks(basetemp)
+  File "C:\Users\hasym\.conda\envs\quant310\lib\site-packages\_pytest\pathlib.py", line 354, in cleanup_dead_symlinks
+    for left_dir in root.iterdir():
+  File "C:\Users\hasym\.conda\envs\quant310\lib\pathlib.py", line 1017, in iterdir
+    for name in self._accessor.listdir(self):
+PermissionError: [WinError 5] �ܾ����ʡ�: 'D:\\hasym\\PycharmProjects\\QuantStudio\\agent_workspace\\_pt5_947755879'
+.....................................................s........           [100%]

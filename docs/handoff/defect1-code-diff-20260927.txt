@@ -1,0 +1,234 @@
+﻿diff --git a/quantstudio/pipeline/quality_audit.py b/quantstudio/pipeline/quality_audit.py
+index 6fb7a73..dc53c86 100644
+--- a/quantstudio/pipeline/quality_audit.py
++++ b/quantstudio/pipeline/quality_audit.py
+@@ -705,6 +705,49 @@ class DataQualityAuditor:
+                 self._add(report, "AdjustmentAnchorDrift", minute_tbl, len(warns), "warning",
+                           f"WARN 0.3-0.5%: {sorted(warns.index)[:10]}")
+ 
++            # === 补漏检（缺陷1，2026-09-27）：minutes.close 对日线 close 独立校验 ===
++            # A1 只验 close_front/close 的「互自洽」，两列同向偏移（如 600649 落库 close=57.13
++            # vs 真值 3.50，+1532%）时比值仍对 → 漏检。此处直接比对 minutes.close 对日线 close，
++            # 覆盖同向偏移。候选与采样 bar 口径与 A1 一致（除权候选 × 14:59~15:01 收盘 bar）。
++            import datetime as _dt
++            _CST = _dt.timezone(_dt.timedelta(hours=8))
++            _day_s = (pd.to_datetime(merged["time"], unit="ms")
++                      .dt.tz_localize("UTC").dt.tz_convert("Asia/Shanghai")
++                      .dt.strftime("%Y-%m-%d"))
++            merged["_day"] = _day_s
++            _daily_tbl = "etf_daily" if minute_tbl == "etf_minutes" else "stock_daily"
++            try:
++                _daily_rows = conn.execute(
++                    f"SELECT code, time, close FROM {_daily_tbl} "
++                    f"WHERE code IN ({placeholders}) AND time >= ? AND time < ?",
++                    codes + [w_lo - 86_400_000, w_hi + 86_400_000]).fetchall()
++            except Exception:
++                continue
++            if _daily_rows:
++                _ddf = pd.DataFrame(_daily_rows, columns=["code", "time", "close"])
++                _ddf["_day"] = (pd.to_datetime(_ddf["time"], unit="ms")
++                                .dt.tz_localize("UTC").dt.tz_convert("Asia/Shanghai")
++                                .dt.strftime("%Y-%m-%d"))
++                _ddf = _ddf.rename(columns={"close": "daily_close"})
++                _m2 = merged.merge(_ddf[["code", "_day", "daily_close"]],
++                                   on=["code", "_day"], how="left")
++                _m2 = _m2.dropna(subset=["daily_close"])
++                if len(_m2):
++                    _m2["raw_dev"] = (_m2["close"] / _m2["daily_close"] - 1).abs()
++                    _per_raw = _m2.groupby("code")["raw_dev"].max()
++                    _raw_fails = _per_raw[_per_raw > self._ANCHOR_DRIFT_FAIL]
++                    _raw_warns = _per_raw[(_per_raw > self._ANCHOR_DRIFT_WARN)
++                                          & (_per_raw <= self._ANCHOR_DRIFT_FAIL)]
++                    if len(_raw_fails):
++                        self._add(report, "MinuteRawVsDaily", minute_tbl, len(_raw_fails),
++                                  "error",
++                                  f"FAIL>0.5%: {sorted(_raw_fails.index)[:10]} "
++                                  f"(max={_per_raw.max():.4f})")
++                    if len(_raw_warns):
++                        self._add(report, "MinuteRawVsDaily", minute_tbl, len(_raw_warns),
++                                  "warning",
++                                  f"WARN 0.3-0.5%: {sorted(_raw_warns.index)[:10]}")
++
+     def _clean_factor_segments(self, fdf: pd.DataFrame) -> pd.DataFrame:
+         """同值段合并 + 污染尖刺剔除。
+ 
+diff --git a/quantstudio/pipeline/sources/mcp_adapter.py b/quantstudio/pipeline/sources/mcp_adapter.py
+index 41a7414..8fe94d7 100644
+--- a/quantstudio/pipeline/sources/mcp_adapter.py
++++ b/quantstudio/pipeline/sources/mcp_adapter.py
+@@ -1832,6 +1832,85 @@ class MCPAdapter(BaseSourceAdapter):
+         logger.warning(f"[MCPAdapter] 线1 冷启动完成：{qdb_tbl} 处理 {total} 行 "
+                        f"→ qfq_aux.db({'fund_adj' if asset_type == 'ETF' else 'adj_factor'})")
+ 
++    @staticmethod
++    def _classify_raw_qfq(cloud_close: float, ratio: float, raw_ref: float,
++                          tol_abs: float = 0.01, tol_rel: float = 0.001,
++                          eps: float = 1e-6) -> str:
++        """判定云端某 (code,day) 参考 bar 返回的是 raw 还是 qfq（方案 A 纯函数）。
++
++        - ratio = adj_latest / adj_i；|ratio-1| ≤ eps → raw==qfq 数学等价 → 判 raw（直写，无副作用）。
++        - cand_raw = cloud_close；cand_qfq = cloud_close × ratio。
++        - 命中判定用「绝对 0.01 元 且 相对 0.1%」双门槛（P0-3）。
++        - 双命中判 raw（无副作用路径）；双不命中返回 'fail'（调用方 fail-fast）。
++
++        Returns: 'raw' | 'qfq' | 'fail'
++        """
++        if abs(ratio - 1.0) <= eps:
++            return "raw"
++        cand_raw = float(cloud_close)
++        cand_qfq = float(cloud_close) * float(ratio)
++        tol = max(tol_abs, abs(float(raw_ref)) * tol_rel)
++        raw_hit = abs(cand_raw - float(raw_ref)) <= tol
++        qfq_hit = abs(cand_qfq - float(raw_ref)) <= tol
++        if raw_hit and qfq_hit:
++            return "raw"       # 双命中判 raw（无副作用）
++        if raw_hit:
++            return "raw"
++        if qfq_hit:
++            return "qfq"
++        return "fail"
++
++    def _get_local_daily_close(self, codes: List[str],
++                               ref_table: str = "stock_daily") -> Dict[str, Dict[str, float]]:
++        """读主库日线 close（raw 参考真值），返回 {code: {day: close}}。
++
++        方案 A 判定的参考来源。day 为 CST 交易日 "YYYY-MM-DD"。
++        ref_table：股票用 stock_daily、ETF 用 etf_daily（审计 R5）。
++        只读；main_db 未配置/读取失败时返回空 dict（调用方按「无参考」降级处理）。
++        """
++        if self.main_db is None:
++            return {}
++        import duckdb
++        result: Dict[str, Dict[str, float]] = {}
++        try:
++            con = duckdb.connect(str(self.main_db), read_only=True)
++            try:
++                ph = ",".join("?" * len(codes))
++                rows = con.execute(
++                    f"SELECT code, time, close FROM {ref_table} "
++                    f"WHERE code IN ({ph}) AND close IS NOT NULL", codes).fetchall()
++            finally:
++                con.close()
++        except Exception as e:
++            logger.warning(f"[MCPAdapter] 读主库 {ref_table}.close 失败: {e}")
++            return {}
++        import datetime as _dt
++        _CST = _dt.timezone(_dt.timedelta(hours=8))
++        for code, time_ms, close in rows:
++            try:
++                day = _dt.datetime.fromtimestamp(int(time_ms) / 1000, _CST).strftime("%Y-%m-%d")
++            except (ValueError, OSError, OverflowError):
++                continue
++            result.setdefault(str(code).split(".")[0], {})[day] = float(close)
++        return result
++
++    @staticmethod
++    def _bar_day_of(df: pd.DataFrame, code_col: str) -> pd.Series:
++        """提取每行交易日（CST "YYYY-MM-DD"），兼容日线 trade_date / 分钟 trade_time/time。"""
++        if "trade_time" in df.columns:
++            s = pd.to_datetime(df["trade_time"], errors="coerce")
++        elif "time" in df.columns and df["time"].dtype.kind in ("i", "f"):
++            # epoch 毫秒 → CST
++            s = pd.to_datetime(df["time"], unit="ms", errors="coerce")
++            s = s.dt.tz_localize("UTC").dt.tz_convert("Asia/Shanghai")
++        elif "trade_date" in df.columns:
++            s = pd.to_datetime(df["trade_date"], errors="coerce")
++        elif "date" in df.columns:
++            s = pd.to_datetime(df["date"], errors="coerce")
++        else:
++            return pd.Series([None] * len(df), index=df.index)
++        return s.dt.strftime("%Y-%m-%d")
++
+     def _restore_to_raw(self, df: pd.DataFrame, table: str,
+                         freq: str,
+                         adj_latest_map: Optional[Dict[str, float]] = None) -> Tuple[pd.DataFrame, Dict]:
+@@ -1955,7 +2034,71 @@ class MCPAdapter(BaseSourceAdapter):
+         # test. The production export path synchronizes the batch factor snapshot before restore
+         # and fails fast if that synchronization cannot write the snapshot.
+ 
+-        ratio = (adj_latest / adj_i).where(valid, 1.0)
++        # === 方案 A（2026-09-27）：per-(code,day) 判定云端 raw/qfq 状态 ===
++        # 不再无条件 ×ratio；而是用本地日线 raw 参考反推云端实际状态：
++        #   判 raw → ratio=1（不还原）；判 qfq → 照旧 ×ratio；ratio≈1 → 直写；无参考/双不命中 → fail-fast。
++        base_ratio = (adj_latest / adj_i).where(valid, 1.0)
++        day = self._bar_day_of(out, code_col)
++
++        # 读本地日线 raw 参考真值（只读主库；ETF 用 etf_daily、股票用 stock_daily，审计 R5）
++        _valid_codes = sorted(bare[valid].unique().tolist())
++        _ref_table = "etf_daily" if asset_type == "ETF" else "stock_daily"
++        daily_close_map = (self._get_local_daily_close(_valid_codes, ref_table=_ref_table)
++                           if _valid_codes else {})
++
++        # 参考 bar 掩码：分钟表取 14:59~15:01 收盘 bar；日线表每行即参考
++        is_minute = str(freq) != "daily"
++        if is_minute and "trade_time" in out.columns:
++            _hhmm = pd.to_datetime(out["trade_time"], errors="coerce").dt.strftime("%H:%M")
++            ref_mask = _hhmm.isin(("14:59", "15:00", "15:01"))
++        elif is_minute and "time" in out.columns and out["time"].dtype.kind in ("i", "f"):
++            _mod = (pd.to_numeric(out["time"], errors="coerce") % 86_400_000)
++            ref_mask = (_mod >= 6 * 3600_000 + 59 * 60_000) & (_mod <= 7 * 3600_000 + 1 * 60_000)
++        else:
++            ref_mask = pd.Series(True, index=out.index)
++
++        ratio = base_ratio.copy()
++        _close_col = "close" if "close" in out.columns else price_cols[0]
++        _keys = bare.astype(str) + "|" + day.astype(str)
++        decided: Dict[str, float] = {}  # key -> 判定后 ratio（'raw' → 1.0）
++        _judged_raw = 0
++        _judged_qfq = 0
++        _no_ref_passthrough = 0  # 无参考但 ratio≈1 → 直写（raw==qfq）
++        for _k, _idx in _keys.groupby(_keys, sort=False).groups.items():
++            _code, _d = _k.split("|", 1)
++            _sub_valid = valid.loc[_idx]
++            if not bool(_sub_valid.any()):
++                continue
++            _v_idx = _idx[_sub_valid.values]
++            _rr = ref_mask.loc[_v_idx]
++            _ref_idx = _v_idx[_rr.values] if bool(_rr.any()) else _v_idx
++            _ref = out.loc[_ref_idx].iloc[-1]
++            _cloud_close = float(pd.to_numeric(_ref[_close_col], errors="coerce"))
++            _r = float(base_ratio.loc[_ref_idx].iloc[-1])
++            _raw_ref = daily_close_map.get(_code, {}).get(_d)
++            if _raw_ref is None:
++                # 无参考：ratio≈1 → 直写（无副作用）；ratio≠1 → fail-fast（选项 A，不写+告警+下批重试）
++                if abs(_r - 1.0) > 1e-6:
++                    raise ValueError(
++                        f"[MCPAdapter] 线1 还原无参考（code={_code} day={_d} ratio={_r:.6f}）："
++                        f"本地 stock_daily 无该日 close 作参考，无法判定云端 raw/qfq，"
++                        f"按选项 A fail-fast（不写库，下批重试）。")
++                _no_ref_passthrough += 1
++                continue
++            _cls = self._classify_raw_qfq(_cloud_close, _r, _raw_ref)
++            if _cls == "raw":
++                decided[_k] = 1.0
++                _judged_raw += 1
++            elif _cls == "qfq":
++                _judged_qfq += 1  # 保持 base_ratio
++            else:
++                raise ValueError(
++                    f"[MCPAdapter] 线1 还原判定失败（code={_code} day={_d}）："
++                    f"云端 close={_cloud_close} 与 raw/×ratio 两候选均不匹配本地日线 raw={_raw_ref}，"
++                    f"fail-fast（不写库）。")
++        if decided:
++            _dec_series = _keys.map(decided)
++            ratio = _dec_series.where(_dec_series.notna(), base_ratio)
+         for col in price_cols:
+             out[col] = pd.to_numeric(out[col], errors="coerce") * ratio
+ 
+@@ -1964,11 +2107,15 @@ class MCPAdapter(BaseSourceAdapter):
+             "restored_rows": int(valid.sum()),
+             "restored_codes": int(bare[valid].nunique()),
+             "restored_price_cols": price_cols,
++            "classify_judged_raw": _judged_raw,
++            "classify_judged_qfq": _judged_qfq,
++            "classify_no_ref_passthrough": _no_ref_passthrough,
+         })
+         logger.info(
+             f"[MCPAdapter] 线1 还原 {table}/{freq}: {meta['restored_rows']} 行 / "
+             f"{meta['restored_codes']} 码 → raw（列={price_cols}，"
+-            f"锚={meta['adj_latest_source']}）")
++            f"锚={meta['adj_latest_source']}；判定 raw={_judged_raw} qfq={_judged_qfq} "
++            f"无参考直写={_no_ref_passthrough}）")
+         return out, meta
+ 
+     # ------------------------------------------------------------------

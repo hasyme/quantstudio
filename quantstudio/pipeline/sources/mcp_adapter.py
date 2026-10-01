@@ -293,6 +293,21 @@ _RESTORE_PRICE_COLS = ("open", "high", "low", "close", "pre_close")
 # 需要还原的四张行情表（与 _QFQ_ADJFACTOR_TABLES 同源，按 canonical 表名去重）
 _RESTORE_TABLES = frozenset({"stock_daily", "etf_daily",
                              "stock_minutes", "etf_minutes"})
+# === 方案 A′（2026-09-28）：表级复权口径 ===
+# 云端 close 恒为前复权（qfq）的表 → 需还原 raw = qfq × adj_latest/adj_i。
+# 未列入者（stock_minutes）云端 close 恒为 raw → 不还原（还原会放大，即缺陷1）。
+# 依据：docs/evidence/cloud-caliber-matrix-forensics-20260927.md（证据等级 A/B+）。
+# 口径漂移由 quality_audit 门禁监控（stock_minutes 翻转 → 阻断）。
+#
+# ⚠ 2026-09-30 记录：曾据「云端 stock_daily/etf_daily = raw」的复核结论
+# （caliber-matrix-full-review-20260930.md）把本集合收缩为 {etf_minutes}，
+# **该复核结论已被推翻**——其"独立基准"用的是云端 stock_minutes，
+# 而该表**同为 qfq**，构成与原矩阵同型的循环论证。
+# 金标准复核（amount/volume 反推真实成交价，口径无关）确证：
+#   stock_daily / etf_daily 云端 = **qfq**（大幅度子集 err_qfq 比 err_raw 小 32~75 倍）。
+# 故本集合**维持原状**（三表还原），P1 收缩已回退。
+# 详见 docs/evidence/caliber-recheck-gold-standard-20260930.md。
+_QFQ_CALIBER_TABLES = frozenset({"stock_daily", "etf_daily", "etf_minutes"})
 # 因子缺失时的兜底策略：fail-fast。静默放行 = 把 qfq 当 raw 写进主库 = 数据污染，
 # 比取数失败严重得多，故宁可让本次任务失败。
 _RESTORE_MISSING_FACTOR_FAIL_FAST = True
@@ -2055,20 +2070,35 @@ class MCPAdapter(BaseSourceAdapter):
         # test. The production export path synchronizes the batch factor snapshot before restore
         # and fails fast if that synchronization cannot write the snapshot.
 
-        ratio = (adj_latest / adj_i).where(valid, 1.0)
+        # === 方案 A′（2026-09-28）：表级复权口径 ===
+        # 口径取证（docs/evidence/cloud-caliber-matrix-forensics-20260927.md）钉死：
+        #   日线表（stock_daily/etf_daily）+ etf_minutes 云端 close 恒为 **qfq**（前复权）
+        #     → 需还原 raw = qfq × adj_latest/adj_i
+        #   stock_minutes 云端 close 恒为 **raw**（不复权）
+        #     → 不还原（原公式会把 raw 放大，即缺陷1）
+        # 证据等级：etf_daily A；stock_daily/stock_minutes/etf_minutes B+。
+        # 2026-09-30 金标准复核（amount/volume 反推真实成交价）**再确认**两日线表为 qfq；
+        # 一次基于「云端 stock_minutes 作基准」的收缩结论已被推翻（同型循环论证）。
+        # 与 v3「逐 (code,day) 用本地参考判定」相比：无外部依赖、无连接冲突、无历史缺日死锁。
+        if str(table) in _QFQ_CALIBER_TABLES:
+            ratio = (adj_latest / adj_i).where(valid, 1.0)   # 云端 qfq → 还原
+        else:
+            ratio = pd.Series(1.0, index=out.index)          # 云端 raw → 不还原
         for col in price_cols:
             out[col] = pd.to_numeric(out[col], errors="coerce") * ratio
 
+        _is_qfq_caliber = str(table) in _QFQ_CALIBER_TABLES
         meta.update({
-            "is_qfq_restored": True,
-            "restored_rows": int(valid.sum()),
-            "restored_codes": int(bare[valid].nunique()),
-            "restored_price_cols": price_cols,
+            "is_qfq_restored": bool(_is_qfq_caliber),
+            "restored_rows": int(valid.sum()) if _is_qfq_caliber else 0,
+            "restored_codes": int(bare[valid].nunique()) if _is_qfq_caliber else 0,
+            "restored_price_cols": price_cols if _is_qfq_caliber else [],
+            "caliber": "qfq" if _is_qfq_caliber else "raw",
         })
         logger.info(
             f"[MCPAdapter] 线1 还原 {table}/{freq}: {meta['restored_rows']} 行 / "
             f"{meta['restored_codes']} 码 → raw（列={price_cols}，"
-            f"锚={meta['adj_latest_source']}）")
+            f"口径={meta['caliber']}，锚={meta['adj_latest_source']}）")
         return out, meta
 
     # ------------------------------------------------------------------

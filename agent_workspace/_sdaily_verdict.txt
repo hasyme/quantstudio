@@ -1,0 +1,12 @@
+配对: 10351
+
+判定：若 cloud_daily == cloud_raw（严格相等），则 daily 云端 = raw
+  exact equal (1e-9): 32.1%
+  within 0.5%:        43.8%
+
+反证：若 daily 是 qfq(基准=最新)，则 ratio 应 = adj_i/adj_latest
+  与 raw 假设 中位误差: 0.0081
+  与 qfq 假设 中位误差: 0.9963
+  -> 更接近: RAW
+
+adj_factor 分布: min=1.0000 max=10055.6400 median=2.4615

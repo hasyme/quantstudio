@@ -1,0 +1,20 @@
+22:57:49 A2R1 START window=2026-01-01..2026-02-15 (log_before=147021)
+22:57:49 spawned PID=25332
+22:58:49 elapsed=1m logStale=0m cpu+32.9s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+22:59:49 elapsed=2m logStale=1m cpu+1.6s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+22:59:49 !! STALL -> graceful stop
+22:59:59 A2R1 END exited=True elapsed=2.2m
+23:02:46 A2R1 START window=2026-01-01..2026-02-15 (log_before=150563)
+23:02:46 spawned PID=26076
+23:03:46 elapsed=1m logStale=0m cpu+51.1s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:04:46 elapsed=2m logStale=1m cpu+1.7s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:05:46 elapsed=3m logStale=2m cpu+2.4s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:06:46 elapsed=4m logStale=0m cpu+1.8s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:07:46 elapsed=5m logStale=1m cpu+2.6s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:08:46 elapsed=6m logStale=0m cpu+2s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:09:46 elapsed=7m logStale=0m cpu+1.8s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:10:46 elapsed=8m logStale=1m cpu+1.5s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:11:46 elapsed=9m logStale=0m cpu+1.9s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:12:46 elapsed=10m logStale=1m cpu+1.9s batch=n/a wrBatches=0 wrRows=0 rowsPerMin=0
+23:12:47 !! STALL -> graceful stop
+23:12:57 A2R1 END exited=True elapsed=10.2m

@@ -1,0 +1,83 @@
+{
+  "verdict": "PASS",
+  "exit_code": 0,
+  "metrics": {
+    "L1": {
+      "name": "L1",
+      "value": 1.0,
+      "threshold": 0.85,
+      "passed": true,
+      "is_soft": false,
+      "summary": "信号方向一致率 100.0%（阈值 85%）",
+      "details": []
+    },
+    "L2": {
+      "name": "L2",
+      "value": {
+        "_any_close": false,
+        "nav_deviation": 0.005032858469887769,
+        "_nav_close": "True",
+        "drawdown_deviation": 0.0,
+        "_dd_close": true,
+        "sharpe_deviation": 0.0,
+        "_sharpe_close": true
+      },
+      "threshold": null,
+      "passed": true,
+      "is_soft": false,
+      "summary": "净值偏差 0.50% / 回撤偏差 0.00% / 夏普偏差 0.00",
+      "details": [
+        {
+          "metric": "末态净值偏差",
+          "local": 1.0049671415301122,
+          "ptrade": 1.01,
+          "deviation": 0.005032858469887769,
+          "threshold": 0.05,
+          "passed": "True"
+        },
+        {
+          "metric": "最大回撤偏差",
+          "local": 0.0,
+          "ptrade": 0.0,
+          "deviation": 0.0,
+          "threshold": 0.03,
+          "passed": true
+        },
+        {
+          "metric": "夏普偏差",
+          "local": 0.0,
+          "ptrade": 0.0,
+          "deviation": 0.0,
+          "threshold": 0.3,
+          "passed": true
+        }
+      ]
+    },
+    "L3": {
+      "name": "L3",
+      "value": 0.0,
+      "threshold": 0.7,
+      "passed": false,
+      "is_soft": true,
+      "summary": "缺持仓数据",
+      "details": []
+    },
+    "L4": {
+      "name": "L4",
+      "value": 0.0,
+      "threshold": 0.01,
+      "passed": true,
+      "is_soft": false,
+      "summary": "effective fee-rate deviation 0.00% (threshold 1%)",
+      "details": []
+    }
+  },
+  "attributable_diffs": [],
+  "source_check": {
+    "consistent": true,
+    "cross_source": false,
+    "engine_source": "tushare",
+    "baseline_source": "tushare",
+    "message": "数据源口径一致: tushare"
+  }
+}
