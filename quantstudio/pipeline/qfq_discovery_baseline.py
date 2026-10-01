@@ -114,6 +114,98 @@ def reserve_pending_slot(conn, *, identity: BaselineIdentity,
     return row is not None
 
 
+# ---------------------------------------------------------------------------
+# 批量变体（A 件：O(N) 显式事务 → 常数批；逐行 API 全部保留，供其他调用方与
+# 既有测试使用）。批量路径把 reserve_pending_slot 的两条语句（UPDATE 命中 /
+# INSERT 建行）拆成「集合 INSERT 建行 → 集合 UPDATE 占槽」两步，判定条件逐条对应：
+#   - 已 applied 同 payload → 不占槽（`IS DISTINCT FROM` 保留）
+#   - 已存在 pending        → 不占槽（`pending_trigger_id IS NULL` 保留）
+# batch_relation 由调用方建为 TEMP 表，须含列：
+#   event_logical_key VARCHAR, trigger_id VARCHAR, payload_hash VARCHAR,
+#   reserved BOOLEAN DEFAULT FALSE, trigger_pre_existing BOOLEAN DEFAULT FALSE
+# 该 TEMP 表须按 event_logical_key 去重（保首行）= 逐行实现的「先到先占」语义。
+# ---------------------------------------------------------------------------
+
+def ensure_baseline_rows_for_batch(conn, *, identity: BaselineIdentity,
+                                   batch_relation: str,
+                                   ts: Optional[str] = None) -> None:
+    """集合等价于 reserve_pending_slot 的 INSERT 分支：缺席 key 先建行（pending=NULL）。"""
+    ts = ts or now_ts()
+    conn.execute(
+        "INSERT INTO qfq_discovery_baseline "
+        "(cutover_id, price_source, source_generation, event_logical_key, "
+        " applied_payload_hash, pending_trigger_id, pending_payload_hash, "
+        " last_trigger_id, applied_at, baselined_at, updated_at) "
+        "SELECT ?, ?, ?, c.event_logical_key, NULL, NULL, NULL, NULL, NULL, ?, ? "
+        f"FROM {batch_relation} AS c "
+        "ON CONFLICT (cutover_id, event_logical_key) DO NOTHING",
+        [identity.cutover_id, identity.price_source, identity.source_generation,
+         ts, ts])
+
+
+def mark_batch_reserved(conn, *, identity: BaselineIdentity,
+                        batch_relation: str) -> None:
+    """在批量关系上标记 reserved = 逐行 reserve_pending_slot 返回 True 的集合。"""
+    conn.execute(
+        f"UPDATE {batch_relation} AS c SET reserved = TRUE "
+        "WHERE EXISTS (SELECT 1 FROM qfq_discovery_baseline b "
+        "WHERE b.cutover_id = ? AND b.event_logical_key = c.event_logical_key "
+        "AND b.pending_trigger_id IS NULL "
+        "AND b.applied_payload_hash IS DISTINCT FROM c.payload_hash)",
+        [identity.cutover_id])
+
+
+def reserve_pending_slots_from_batch(conn, *, identity: BaselineIdentity,
+                                     batch_relation: str,
+                                     ts: Optional[str] = None) -> None:
+    """集合等价于 reserve_pending_slot 的 UPDATE 命中分支：占槽（pending CAS）。"""
+    ts = ts or now_ts()
+    conn.execute(
+        "UPDATE qfq_discovery_baseline AS b "
+        "SET pending_trigger_id = c.trigger_id, pending_payload_hash = c.payload_hash, "
+        f"updated_at = ? FROM {batch_relation} AS c "
+        "WHERE b.cutover_id = ? AND b.event_logical_key = c.event_logical_key "
+        "AND b.pending_trigger_id IS NULL "
+        "AND b.applied_payload_hash IS DISTINCT FROM c.payload_hash",
+        [ts, identity.cutover_id])
+
+
+def mark_batch_pre_existing_triggers(conn, batch_relation: str) -> None:
+    """标记 reserved 中 trigger_id 已在队列的行（= 逐行 INSERT OR IGNORE 冲突集）。
+
+    **必须在 trigger 落队之前调用**：只有插入前已在队列中的 trigger_id 才算冲突，
+    与逐行实现 `inserted is None` 的断言触发条件逐位对应。
+    """
+    conn.execute(
+        f"UPDATE {batch_relation} AS c SET trigger_pre_existing = TRUE "
+        "WHERE c.reserved AND EXISTS (SELECT 1 FROM qfq_trigger_queue t "
+        "WHERE t.trigger_id = c.trigger_id)")
+
+
+def assert_batch_pending_slots_match(conn, *, identity: BaselineIdentity,
+                                     batch_relation: str) -> None:
+    """批量版 assert_existing_trigger_matches_pending_slot（告警不得被批量吞掉）。
+
+    逐行实现只在 `INSERT OR IGNORE` 冲突（trigger_id 已存在）时断言；此处对同一集合
+    （reserved ∧ trigger_pre_existing）逐条等价校验，任一不一致即抛 DiscoveryBaselineError。
+    """
+    bad = conn.execute(
+        "SELECT c.event_logical_key, b.pending_trigger_id, b.pending_payload_hash, "
+        "b.price_source, b.source_generation "
+        f"FROM {batch_relation} AS c JOIN qfq_discovery_baseline AS b "
+        "ON b.cutover_id = ? AND b.event_logical_key = c.event_logical_key "
+        "WHERE c.reserved AND c.trigger_pre_existing AND ("
+        "b.pending_trigger_id IS DISTINCT FROM c.trigger_id "
+        "OR b.pending_payload_hash IS DISTINCT FROM c.payload_hash "
+        "OR b.price_source IS DISTINCT FROM ? "
+        "OR b.source_generation IS DISTINCT FROM ?)",
+        [identity.cutover_id, identity.price_source,
+         identity.source_generation]).fetchall()
+    if bad:
+        raise DiscoveryBaselineError(
+            f"批量 pending slot 与既有 trigger 不一致（{len(bad)} 行）: {bad[:5]!r}")
+
+
 def assert_existing_trigger_matches_pending_slot(conn, *, identity: BaselineIdentity,
                                                   event_logical_key: str,
                                                   trigger_id: str,

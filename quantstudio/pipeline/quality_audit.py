@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 @dataclass
@@ -20,10 +20,27 @@ class QualityIssue:
 class QualityReport:
     issues: List[QualityIssue] = field(default_factory=list)
     checks_run: int = 0
+    # 可中断审计（daemon-interruptible-quality-audit-design.md）：中断时
+    # interrupted=True；skipped_after_stop = 因停请求被跳过的**顶层段**数
+    # （检查点序号差口径，见 DataQualityAuditor._checkpoint）。
+    # 两字段默认值保证既有构造点/消费点逐位不变。
+    interrupted: bool = False
+    skipped_after_stop: int = 0
 
     @property
     def passed(self) -> bool:
         return not any(issue.severity == "error" and issue.count > 0 for issue in self.issues)
+
+
+class AuditInterrupted(Exception):
+    """审计检查点因停请求中止（私有类型：仅 run() 顶层捕获，不外泄）。
+
+    真实失败（连接/查询错误等）仍按原路径冒泡，不被误吞。
+    """
+
+    def __init__(self, checkpoint: str):
+        super().__init__(checkpoint)
+        self.checkpoint = checkpoint
 
 
 class DataQualityAuditor:
@@ -40,7 +57,8 @@ class DataQualityAuditor:
                  qfq_thresholds: Optional[Dict] = None,
                   qfq_identity: Optional[Dict] = None,
                  qfq_aux_override: Optional[str | Path] = None,
-                 qfq_aux_paths_config: Optional[str | Path] = None):
+                 qfq_aux_paths_config: Optional[str | Path] = None,
+                 should_stop: Optional[Callable[[], bool]] = None):
         """shared_conn: 可选，外部传入的持久 read_write 连接（采集流程内复用 writer 连接，
         避免开 read_only 与 write 并发触发「different configuration」冲突）。
         不传则自开 read_only 短连接（CLI/独立运行场景）。
@@ -50,7 +68,13 @@ class DataQualityAuditor:
         qfq_orchestrator.quality_thresholds 块）。**None（默认）= 完全跳过 QFQ
         专项审计**（编排器 disabled 时保持旧行为，不因历史 qfq 表残留新增失败）；
         非 None 时启用 dead_letter / pending SLA / stale in_progress /
-        残留 pending watermark intent 四项检查。"""
+        残留 pending watermark intent 四项检查。
+        should_stop: 可选，返回 True = 已收到停止请求 → 审计在下一个检查点中止
+        （已执行项结论保留、未执行项计入 skipped_after_stop）。**缺省 None ⇒ 零
+        开销且行为逐位不变**（CLI / 测试 / 未接入的调用点）。
+
+        注意：判据由调用方提供，**只读调用方已缓存的 stop 标志**；本模块不读、
+        也不得读 daemon_stop.request（该文件在收尾前已被消费删除）。"""
         self.db_path = Path(db_path)
         self.schemas = schemas
         self.batch_audit_path = Path(batch_audit_path) if batch_audit_path else None
@@ -67,6 +91,11 @@ class DataQualityAuditor:
         self.qfq_aux_override = Path(qfq_aux_override) if qfq_aux_override else None
         self.qfq_aux_paths_config = Path(qfq_aux_paths_config) if qfq_aux_paths_config else None
         self._price_source = str((self._qfq_identity or {}).get("price_source", "mcp"))
+        self._should_stop = should_stop
+        # 检查点序号差口径的计数器（run() 内按实际表数/条件段重置；直调
+        # _audit_* 且注入 should_stop 时不致 AttributeError）
+        self._ckpt_top_total = 0
+        self._ckpt_top_done = 0
 
     @classmethod
     def from_config(cls, db_path: str | Path, rules_path: str | Path,
@@ -74,6 +103,25 @@ class DataQualityAuditor:
                     quarantine_path: Optional[str | Path] = None):
         rules = json.loads(Path(rules_path).read_text(encoding="utf-8"))
         return cls(db_path, rules["schemas"], batch_audit_path, quarantine_path)
+
+    def _checkpoint(self, report: QualityReport, item: str, top: bool = False) -> None:
+        """审计检查点：停请求已发出则中止本轮审计。
+
+        - should_stop=None ⇒ 立即返回（零开销、行为逐位不变）。
+        - top=True：计入**顶层段**序号（表边界 / 全局段边界），用于
+          `skipped_after_stop = 顶层段总数 - 已完成顶层段数 + 1`（含当前段）。
+        - 中止方式：置 report 标记后抛私有 AuditInterrupted，由 run() 顶层捕获
+          ——不入库、不写盘，也不吞掉任何真实异常。
+        """
+        if self._should_stop is None:
+            return
+        if top:
+            self._ckpt_top_done += 1
+        if self._should_stop():
+            report.interrupted = True
+            report.skipped_after_stop = max(
+                1, self._ckpt_top_total - self._ckpt_top_done + 1)
+            raise AuditInterrupted(item)
 
     def run(self) -> QualityReport:
         import duckdb
@@ -85,9 +133,18 @@ class DataQualityAuditor:
         if conn is None:
             own_conn = duckdb.connect(str(self.db_path), read_only=True)
             conn = own_conn
+        self._ckpt_top_done = 0
+        self._ckpt_top_total = 0
         try:
             tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+            # 顶层段总数（检查点序号差口径的分母）= 表循环 N 段
+            # + 4 个无条件全局段（分钟锚点漂移 / 因子单调性 / batch_pipeline /
+            #   quarantine）+ 2 个条件段（source_watermark / QFQ 编排）。
+            self._ckpt_top_total = (len(self.schemas) + 4
+                                    + (1 if "source_watermark" in tables else 0)
+                                    + (1 if self._qfq_thresholds is not None else 0))
             for table, schema in self.schemas.items():
+                self._checkpoint(report, f"table:{table}", top=True)
                 if table not in tables:
                     self._add(report, "TableMissing", table, 1, "error", "schema 已定义但数据库无表")
                     continue
@@ -201,20 +258,30 @@ class DataQualityAuditor:
                         self._add(report, "DividendNonImplemented", table, non_implemented, "error",
                                   "non-implemented dividend records exist")
             if "source_watermark" in tables:
+                self._checkpoint(report, "segment:watermarks", top=True)
                 self._audit_watermarks(conn, report, tables)
             if self._qfq_thresholds is not None:
+                self._checkpoint(report, "segment:qfq_orchestration", top=True)
                 self._audit_qfq_orchestration(conn, report, tables)
             # A1：分钟 front 锚点漂移巡检（mcp-minute-front-anchor-design.md §4 阶段1）
+            self._checkpoint(report, "segment:minute_anchor_drift", top=True)
             self._audit_minute_anchor_drift(conn, report, tables)
             # A2：因子序列非单调告警（同上）
+            self._checkpoint(report, "segment:factor_monotonicity", top=True)
             self._audit_factor_monotonicity(conn, report)
             # A3（缺陷1 方案 A′ §5.3）：云端口径漂移门禁
             self._audit_caliber_drift(conn, report, tables)
+            self._checkpoint(report, "segment:batch_pipeline", top=True)
+            self._audit_batch_pipeline(report)
+            self._checkpoint(report, "segment:quarantine", top=True)
+            self._audit_quarantine(report)
+        except AuditInterrupted:
+            # 停请求在检查点生效：本轮审计未跑完。已执行项结论保留在 report，
+            # 未执行项由 skipped_after_stop 如实标记（绝不伪造「已通过」）。
+            pass
         finally:
             if own_conn is not None:
                 own_conn.close()
-        self._audit_batch_pipeline(report)
-        self._audit_quarantine(report)
         return report
 
 
@@ -296,6 +363,7 @@ class DataQualityAuditor:
 
     def _audit_schema_constraint(self, conn, report, table, col, spec):
         """Mirror schema-driven pre-ingest constraints on persisted rows."""
+        self._checkpoint(report, f"constraint:{table}.{col}")
         qcol = f'"{col}"'
         if spec.get("regex"):
             pattern = str(spec["regex"]).replace("'", "''")
@@ -322,6 +390,7 @@ class DataQualityAuditor:
             self._add(report, "GreaterEqual", table, count, "error", f"{col}>={spec['ge']}")
 
     def _audit_prices(self, conn, report, table, columns):
+        self._checkpoint(report, f"prices:{table}")
         raw = {"open", "high", "low", "close"}
         if raw.issubset(columns):
             bad = conn.execute(
@@ -337,6 +406,7 @@ class DataQualityAuditor:
                 'AND (amount/(close*volume)<0.5 OR amount/(close*volume)>2.0)').fetchone()[0]
             self._add(report, "UnitConsistency", table, unit, "warning")
         for side in ("front", "back"):
+            self._checkpoint(report, f"prices:{table}/{side}")
             adjusted = [f"{name}_{side}" for name in ("open", "high", "low", "close")]
             if not set(adjusted).issubset(columns):
                 continue
@@ -397,6 +467,8 @@ class DataQualityAuditor:
                     f'AND "close_{side}" IS NULL').fetchone()[0]
                 self._add(report, "AdjustmentCoverage", table, missing, "error", f"tushare/{side}")
         if {"code", "time", "close", "close_front", "close_back"}.issubset(columns):
+            # 最贵单语句（分钟表全表双 ROW_NUMBER）——须前置可退（设计 §2.3）
+            self._checkpoint(report, f"anchor:{table}")
             anchor = conn.execute(
                 f'''WITH ranked AS (
                     SELECT *, ROW_NUMBER() OVER(PARTITION BY code ORDER BY time) first_n,
@@ -408,6 +480,7 @@ class DataQualityAuditor:
             self._add(report, "AdjustmentAnchor", table, anchor, "warning",
                       "部分数据源复权基准不保证库内首尾=原价")
         if {"code", "time", "close_front", "pctChg"}.issubset(columns) and table.endswith("daily"):
+            self._checkpoint(report, f"return_consistency:{table}")
             continuity = conn.execute(
                 f'''WITH x AS (
                     SELECT code,time,close_front,pctChg,
@@ -419,6 +492,7 @@ class DataQualityAuditor:
                       "需结合源官方收益口径复核")
 
     def _audit_frequency(self, conn, report, table, columns):
+        self._checkpoint(report, f"frequency:{table}")
         if not {"time", "freq"}.issubset(columns):
             self._add(report, "FrequencyColumns", table, 1, "error")
             return
@@ -431,6 +505,7 @@ class DataQualityAuditor:
         self._add(report, "FrequencyGrid", table, grid, "error")
 
     def _audit_future_and_pit(self, conn, report, table, columns):
+        self._checkpoint(report, f"future_pit:{table}")
         import time
         now_ms = int(time.time() * 1000)
         for col in ("time", "ann_date", "end_date", "ex_date", "change_date", "delist_date"):

@@ -75,6 +75,12 @@ def start_daemon_subprocess(config_dir: Path) -> Tuple[str, subprocess.Popen]:
     Popen 不写 status 文件——避免 daemon 启动失败时残留错误 status。
     stdout/stderr 重定向到 daemon_bootstrap_{token}.log（按 token 分文件）。
     """
+    # 三轮裁定 §3.3 #2：hold 门二次校验（GUI 路径唯一入口）。
+    # 时点：任何副作用（建 bootstrap 文件 / Popen）之前；命中 ⇒ 抛 HoldActiveError，
+    # GUI 据此拒绝启动并提示用户（不静默、不 Popen）。
+    from quantstudio.pipeline.daemon_hold_gate import ensure_not_held
+    ensure_not_held("gui.daemon_process.start_daemon_subprocess")
+
     token = uuid.uuid4().hex
     _data_root().mkdir(parents=True, exist_ok=True)
     log_dir = _data_root() / "logs"

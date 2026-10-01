@@ -65,7 +65,7 @@ class _FakeCollector:
         self.executed.append(task["name"])
         return True
 
-    def _run_full_quality_audit(self):
+    def _run_full_quality_audit(self, should_stop=None):
         if self.fail_audit:
             raise RuntimeError("audit failed")
         return True
@@ -476,6 +476,63 @@ class TestStartDaemonSubprocess:
         tail_a = read_bootstrap_log_tail(token_a)
         assert "token a" in tail_a
         assert "token b" not in tail_a
+
+
+# ===========================================================================
+# D 件：质量审计「可中断」接入收尾（run_state 双字段）
+# ===========================================================================
+
+class _FakeInterruptingCollector(_FakeCollector):
+    """模拟「stop 已消费 → 审计在检查点中止」的 collector。"""
+
+    def __init__(self):
+        super().__init__()
+        self.seen_should_stop = None
+
+    def _run_full_quality_audit(self, should_stop=None):
+        self.seen_should_stop = bool(should_stop()) if should_stop else None
+        self._last_quality_audit = {"interrupted": True, "skipped_after_stop": 5}
+        return False
+
+
+class TestInterruptibleQualityAudit:
+    """设计 §5-3/§5-7：中断标记诚实 + 终态不回归。"""
+
+    def test_interrupted_audit_recorded_in_run_state(self, tmp_data_root, monkeypatch):
+        fc = _FakeInterruptingCollector()
+        lc = _make_lifecycle(tmp_data_root)
+        original = fc.execute_task
+
+        def execute_and_stop(task, mode="incremental", run_quality_audit=False):
+            original(task, mode=mode, run_quality_audit=run_quality_audit)
+            _write_stop_request(tmp_data_root, lc.instance_token)
+            return True
+
+        fc.execute_task = execute_and_stop
+        _patch_from_configs(monkeypatch, fc)
+        lc.run_one_cycle({"tasks": [{"name": "a", "enabled": True, "table": "t"}]})
+        rs = _read_run_state(tmp_data_root)
+        # 终态不回归：仍落 interrupted（can_complete 不含 quality_audit_ok）
+        assert rs["status"] == "interrupted"
+        assert rs["stop_requested"] is True
+        assert rs["traversal_completed"] is False
+        assert rs["quality_audit_ok"] is False
+        # 双字段如实入 run_state
+        assert rs["interrupted"] is True
+        assert rs["skipped_after_stop"] == 5
+        # should_stop 读的是已缓存的 stop 标志（非重读 daemon_stop.request）
+        assert fc.seen_should_stop is True
+
+    def test_completed_cycle_records_not_interrupted(self, tmp_data_root, monkeypatch):
+        fc = _FakeCollector()
+        lc = _make_lifecycle(tmp_data_root)
+        _patch_from_configs(monkeypatch, fc)
+        lc.run_one_cycle({"tasks": [{"name": "a", "enabled": True, "table": "t"}]})
+        rs = _read_run_state(tmp_data_root)
+        assert rs["status"] == "completed"
+        assert rs["quality_audit_ok"] is True
+        assert rs["interrupted"] is False
+        assert rs["skipped_after_stop"] == 0
 
 
 def test_schedule_skip_weekdays_logic():
