@@ -528,16 +528,15 @@ class DataQualityAuditor:
             if table not in tables or watermark is None:
                 continue
             columns = {row[0] for row in conn.execute(f'DESCRIBE "{table}"').fetchall()}
-            # 优先使用 schema 的 time_key（与 daemon 水位推进口径 _advance_actual_watermark /
-            # _get_safe_watermark 对齐），避免审计与采集用两套 time_col 导致 watermark 误报。
+            # 仅 schema 显式声明 time_key 的表做「水位 vs 表内业务日期」一致性校验，
+            # 与 daemon._get_safe_watermark 的「无 time_key 就不校验表内日期」口径一致。
+            # 无 time_key 的表（含快照表）水位语义非「数据业务日期」，本校验不适用——
+            # 旧版此处 fallback 到 delist_date 等候选列，会把快照表的退市日期误当业务日期，
+            # 导致 WatermarkConsistency 误报（stock_basic 复现，2026-10-01）。
             schema_time_key = self.schemas.get(table, {}).get("time_key") if self.schemas else None
-            if schema_time_key and schema_time_key in columns:
-                time_col = schema_time_key
-            else:
-                time_col = next((col for col in ("time", "end_date", "ex_date", "change_date", "delist_date")
-                                 if col in columns), None)
-            if not time_col:
+            if not schema_time_key or schema_time_key not in columns:
                 continue
+            time_col = schema_time_key
             where = []
             if "data_source" in columns:
                 where.append(f"data_source='{str(source).replace(chr(39), chr(39)*2)}'")
