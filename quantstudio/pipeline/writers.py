@@ -426,11 +426,23 @@ class DuckDBWriter(BaseWriter):
         # （DuckDB 规则：同 db 文件 read_only 与 read_write 不能并存，哪怕不同线程）。
         # 所有内部查询统一走 read_write，永不冲突。GUI 的 read_only 查询属独立进程范畴。
         self._shared_conn = None
+        # v3.1：写入分档 fail-closed 熔断状态（内存态、进程级，不落库、不引入新文件）
+        self._write_batch_seq = 0          # 批次序号（滑动窗口基准，每批 +1）
+        self._dedup_fail_marks = []        # 窗口内 fail-closed 发生的批次序号
+        self._dedup_circuit_open = False   # True ⇒ P1 自我熔断，一律走 ON CONFLICT 原路径
         self._init_tables()
 
     # ── T1（2026-09-17）：RW 打开退避重试与持有者归因 ──
     # 退避序列合计 30s（全窗统一，两处 RW 打开点共用）
     _RW_BACKOFF_SECONDS = (1, 2, 4, 8, 15)
+
+    # ── v3.1：写入分档 fail-closed 熔断（见 docs/duckdb-conflict-hang-mitigation-design.md §3.1.1）──
+    # 背景：去重计数 SELECT 失败时 fail-closed 回退 ON CONFLICT；若持续失败，P1 纯 INSERT
+    # 规避会"表面正常、实则静默失效"，故需窗口计数 + 熔断使运维可发现。
+    # 滑动窗口 = 最近 N 批；窗口内失败 ≥WARN 次告警，≥OPEN 次 ⇒ P1 自我熔断。
+    _DEDUP_FAIL_WINDOW_BATCHES = 20
+    _DEDUP_FAIL_WARN_AT = 3
+    _DEDUP_FAIL_OPEN_AT = 10
 
     def _describe_lock_holder(self):
         """psutil 归因：谁可能持有该库（**尽力而为**，不可得则返回 None，不得抛）。
@@ -696,6 +708,43 @@ class DuckDBWriter(BaseWriter):
         finally:
             release_write_lock()
 
+    # ── v3.1：fail-closed 滑动窗口计数与熔断（设计文档 §3.1.1）──
+    def _dedup_fail_window_hits(self) -> int:
+        """当前滑动窗口内 fail-closed 命中次数。"""
+        return len(self._dedup_fail_marks)
+
+    def _dedup_circuit_reset(self) -> None:
+        """复位 P1 熔断与窗口计数（人工确认后调用；纯内存态，不落库）。"""
+        self._dedup_circuit_open = False
+        self._dedup_fail_marks = []
+
+    def _record_dedup_fail_closed(self, table: str) -> None:
+        """登记一次 fail-closed 触发：滑动窗口计数 + 熔断判定。
+
+        P1-1 背景：若去重计数 SELECT 持续失败，每批都 fail-closed 回退 ON CONFLICT，
+        则 P1 纯 INSERT 规避会"表面正常、实则静默失效"，运维无法区分"本批真有更新"
+        与"计数失败回退"。故窗口内达阈值即告警/熔断，使失效可被发现。
+        """
+        seq = self._write_batch_seq
+        self._dedup_fail_marks.append(seq)
+        # 滑动窗口：仅保留最近 _DEDUP_FAIL_WINDOW_BATCHES 批内的命中
+        cutoff = seq - self._DEDUP_FAIL_WINDOW_BATCHES
+        while self._dedup_fail_marks and self._dedup_fail_marks[0] <= cutoff:
+            self._dedup_fail_marks.pop(0)
+        hits = len(self._dedup_fail_marks)
+        if hits >= self._DEDUP_FAIL_OPEN_AT:
+            if not self._dedup_circuit_open:
+                self._dedup_circuit_open = True
+                logger.critical(
+                    f"[DuckDBWriter] 去重计数在最近 {self._DEDUP_FAIL_WINDOW_BATCHES} 批内"
+                    f"失败 {hits} 次，P1 写入分档自我熔断：后续批次一律走 ON CONFLICT"
+                    f"原路径（P1 规避已失效，请转 P2/P3 兜底；table={table}）")
+        elif hits >= self._DEDUP_FAIL_WARN_AT:
+            logger.error(
+                f"[DuckDBWriter] 去重计数在最近 {self._DEDUP_FAIL_WINDOW_BATCHES} 批内"
+                f"失败 {hits} 次，本批 fail-closed 回退 ON CONFLICT"
+                f"（P1 规避本批未生效；table={table}）")
+
     def _write_locked(self, df: pd.DataFrame, table: str, batch_id: str,
                       passthrough: bool = False) -> int:
         """write() 的锁内实现（3A 重构：原 write 主体平移，逻辑零改动）。"""
@@ -818,22 +867,54 @@ class DuckDBWriter(BaseWriter):
                     "stock_namechange": "(code, change_date)",
                     "stock_delist": "(code, market)",
                 }.get(table)
-                # 写前：数本批主键在目标表已存在的行数（=将被 UPDATE 的，走索引快）
+                # 写前：数本批主键在目标表已存在的行数（=将被 UPDATE 的）
+                # v3.1（docs/duckdb-conflict-hang-mitigation-design.md）三态：
+                #  a) 计数成功且 == 0 ⇒ 本批主键**全部新增** ⇒ 纯 INSERT，避开 ON CONFLICT
+                #     的索引冲突检查/更新维护路径（规避 DuckDB 长期写入索引异常停摆缺陷）；
+                #  b) 计数成功且 > 0  ⇒ 本批含更新 ⇒ 原 ON CONFLICT 路径（行为零变化）；
+                #  c) 计数失败 ⇒ **fail-closed**：保守视为"本批全部为更新"，回退 ON CONFLICT
+                #     原路径（异常行为不变，禁止误走纯 INSERT 而引入 IntegrityError）；
+                #     取哨兵 int = len(df)（**非 None**），保证下游 new_rows 与
+                #     WriteResult 三字段恒为 int 且 new + updated == len(df) 守恒。
+                #  熔断：_dedup_circuit_open 时不再计数与分档，一律走原路径（P1 自我熔断）。
+                self._write_batch_seq += 1
                 updated_rows = 0
+                dedup_count_failed = False
                 if pk_cols:
-                    try:
-                        updated_rows = conn.execute(
-                            f"SELECT COUNT(*) FROM {table} WHERE {pk_cols} IN "
-                            f"(SELECT {pk_cols} FROM _tmp_write)").fetchone()[0]
-                    except Exception:
-                        updated_rows = 0
+                    if self._dedup_circuit_open:
+                        # P1 已熔断：不尝试计数，直接按"含更新"处理（等价修复前行为）
+                        dedup_count_failed = True
+                        updated_rows = len(df)
+                    else:
+                        try:
+                            updated_rows = conn.execute(
+                                f"SELECT COUNT(*) FROM {table} WHERE {pk_cols} IN "
+                                f"(SELECT {pk_cols} FROM _tmp_write)").fetchone()[0]
+                        except Exception:
+                            # fail-closed：哨兵 int，保守"全部更新"；登记窗口命中
+                            dedup_count_failed = True
+                            updated_rows = len(df)
+                            self._record_dedup_fail_closed(table)
                 if pk_cols:
-                    col_list = ", ".join(df.columns)
-                    update_set = ", ".join(f"{c}=EXCLUDED.{c}" for c in df.columns)
-                    conn.execute(
-                        f"INSERT INTO {table} ({col_list}) "
-                        f"SELECT * FROM _tmp_write "
-                        f"ON CONFLICT {pk_cols} DO UPDATE SET {update_set}")
+                    if dedup_count_failed or updated_rows > 0:
+                        # 含更新 / 计数不可用 / 已熔断 ⇒ 原 ON CONFLICT 路径（行为不变）
+                        col_list = ", ".join(df.columns)
+                        update_set = ", ".join(f"{c}=EXCLUDED.{c}" for c in df.columns)
+                        conn.execute(
+                            f"INSERT INTO {table} ({col_list}) "
+                            f"SELECT * FROM _tmp_write "
+                            f"ON CONFLICT {pk_cols} DO UPDATE SET {update_set}")
+                    else:
+                        # 本批主键全部新增 ⇒ 纯 INSERT（P1 规避路径）
+                        # 必须显式带列名列表：与 ON CONFLICT 分支保持**同一列投影语义**。
+                        # df 常为表的列子集（如 3 列写入 42 列的表），裸写
+                        # `INSERT INTO t SELECT *` 会让 DuckDB 按全表列对齐，报
+                        # "table t has N columns but M values were supplied"（实测回归，
+                        # 见 tests/test_pipeline_guardrails.py::test_writer_upsert_...）。
+                        col_list = ", ".join(df.columns)
+                        conn.execute(
+                            f"INSERT INTO {table} ({col_list}) "
+                            f"SELECT * FROM _tmp_write")
                 else:
                     conn.execute(f"INSERT INTO {table} SELECT * FROM _tmp_write")
                 conn.unregister("_tmp_write")
@@ -858,8 +939,10 @@ class DuckDBWriter(BaseWriter):
                     )
             finally:
                 conn.close()
+        # v3.1 P2-1：fail-closed 批次补显式标记，与"真实全更新批"可区分（运维可观测）
+        _fc_tag = " (fail-closed→ON CONFLICT)" if dedup_count_failed else ""
         logger.info(f"[DuckDBWriter] {table} batch={batch_id}: wrote {len(df)} rows "
-                    f"(新增 {new_rows} + 更新 {updated_rows}) 防重复 upsert")
+                    f"(新增 {new_rows} + 更新 {updated_rows}){_fc_tag} 防重复 upsert")
         # 返回 WriteResult：作为 int = 提交行数（向后兼容），.new/.updated 供审计使用
         return WriteResult(len(df), new_rows, updated_rows)
 

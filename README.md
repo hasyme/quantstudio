@@ -466,6 +466,35 @@ W2-0.8 审核发现 9 项问题，W2-0.9 逐项关闭（详见 `docs/framework-f
 
 测试：新增 5 个测试文件（43 项）+ 现有 staging 测试适配；W2-0.9 专项 **165 passed**；全量 **1676 passed, 1 warning**（唯一 warning 与 W2 无关，原样保留）。
 
+### DuckDB 写入停摆缺陷：框架层写入分档规避（2026-10-02）
+
+- **背景**：DuckDB 组件在长期反复 `INSERT ... ON CONFLICT` 写入后，主键索引（ART）结构异常，
+  更新动作触发引擎级死循环并使采集**停摆**（上游已确认该缺陷 **1.5.x 全线存在**，
+  官方修复在下一大版本；不影响已有数据、不损坏数据）。2026-10-02 凌晨生产任务卡死已由
+  py-spy 取证（Python 侧落在 `writers.py` 的 ON CONFLICT 执行点，native 侧落在
+  `duckdb::BufferManager::GetBufferManager`）。
+- **P1 写入分档**：`_write_locked` 复用既有 `updated_rows` 计数分档——本批主键**全部新增**
+  时降级为纯 `INSERT`（**带显式列名**，避开 ON CONFLICT 的索引冲突检查/更新维护路径）；
+  含更新时保留原 `ON CONFLICT` 路径，**行为零变化**。
+- **fail-closed（哨兵 int）**：去重计数 SELECT 失败时**保守视为"本批全部为更新"**并回退
+  ON CONFLICT，取哨兵 `len(df)`（**非 None**）保证 `new_rows` 与 `WriteResult` 三字段恒为 int
+  且 `new + updated == len(df)` 守恒——禁止误走纯 INSERT 而引入 `IntegrityError`
+  （异常行为不变，守住"不改变异常行为"红线）。
+- **熔断**：滑动窗口（20 批）内 fail-closed ≥3 次告警、≥10 次触发 **P1 自我熔断**
+  （一律回退原路径），防止"表面正常、实则 P1 静默退化回原缺陷路径"而不可被发现。
+- **验收（六门全绿）**：门 1 分档与等价性（双库对照，含**列子集**回归锚点）、
+  门 2 长时回归（**125.1 分钟 / 686 批 / 3430 万行 / 零 stall / PASS**）、
+  门 3 契约门 + 6 策略 api_portability、门 4 回归归因（修复前 34 failed → 修复后 23 failed，
+  余下均为基线既有失败）、门 5 黄金对比（修复前后落库**逐行一致**）、
+  门 6 异常路径（9 例 + 真红态验证：哨兵改回 `None` 即红）。
+- **文档**：`docs/duckdb-conflict-hang-mitigation-design.md`（v3.1）、
+  `docs/evidence/duckdb-conflict-hang-forensics-20261002.md`（现场取证）、
+  `docs/evidence/duckdb-conflict-hang-acceptance-gate2-20261002.md`（门 2）、
+  `docs/evidence/duckdb-conflict-hang-acceptance-gate3-6-20261002.md`（门 3-6）。
+- **遗留**：① 生产实战回归未做（建议重跑 `mcp_stock_daily` 补齐主表缺失数据，该过程本身
+  即等价一次真实长时回归）；② 根因在 DuckDB 引擎侧，本线为**规避**而非根治，
+  待官方 1.6.x 发布后评估升级并回退规避代码。
+
 ### Profile 1.10.0
 
 - PTrade Profile 升级至 1.10.0：正式登记 `get_stock_exrights(security, date=None)`（返回 DataFrame，index=date，列: allotted_ps/rationed_ps/rationed_px/bonus_ps/exer_forward_a/exer_backward_a/bexer_backward_a/b）。portable usage 必须显式传 `date`；`date=None` 返回 `None`（底层查询需具体日期）。
