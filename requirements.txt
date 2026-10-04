@@ -1,3 +1,4 @@
-duckdb>=1.4.5,<1.5
-# issue duckdb#23645 回归钉版（1.5.x ART index-delete fatal，含 1.5.5）
-# 升级评估：duckdb v2.0 正式发布并确认含该修复后重议
+duckdb>=1.4.5,<1.6
+# 放开 1.5.x：1.5.6 修复 stock_daily 新主键写入停摆（H9 完整 daemon 副本 A/B 实证，2026-10-04）
+# 仍保留 #23645 风险（1.5.x ART index-DELETE fatal）；本负载以 upsert 为主，风险评估已接受
+# 升级评估：duckdb v2.0 正式发布并确认含 #23645 修复后重议
