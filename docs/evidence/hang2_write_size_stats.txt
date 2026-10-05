@@ -1,0 +1,5 @@
+stock_daily_valuation                  n= 664  max=   50000  p50=   50000  mean=    49066  total= 32579696
+stock_daily                            n= 224  max=   50000  p50=   50000  mean=    49097  total= 10997748
+etf_daily                              n=  43  max=   50000  p50=   49905  mean=    46182  total=  1985827
+stock_basic                            n=   4  max=    5242  p50=    5242  mean=     5242  total=    20968
+etf_basic                              n=   2  max=    1606  p50=    1606  mean=     1606  total=     3212

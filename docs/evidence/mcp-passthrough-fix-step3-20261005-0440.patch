@@ -1,0 +1,1696 @@
+diff --git a/config/profiles/mcp_only/sources_config.json b/config/profiles/mcp_only/sources_config.json
+index 34c7b76..2027a3a 100644
+--- a/config/profiles/mcp_only/sources_config.json
++++ b/config/profiles/mcp_only/sources_config.json
+@@ -10,6 +10,10 @@
+       "landing_subdir": "mcp_landing",
+       "upstream_authority": "mcp",
+       "export_async": true,
++      "passthrough_export_fallback": true,
++      "passthrough_export_window_tables": [],
++      "_note_passthrough_export_fallback": "2026-10-05 开启（F-1/F-2 首轮拉取修复 §3.2/§3.4）：passthrough 表 fetch_page 首页超时（含重试预算耗尽）时自适应降级到 export Parquet 通道；false = 完全不探测，_fetch_passthrough 与修复前逐行等效。",
++      "_note_passthrough_export_window_tables": "2026-10-05 置空（fail-safe）：export 窗口下推白名单，元素 = canonical table 名（非 qdb_table）；仅 §3.0 探针「带窗行数==不带窗行数」通过的表才可填入。探针证据见 docs/evidence/mcp-passthrough-window-pushdown-probe-20261005-0403.md——llm_text_events/llm_text_events_enriched/llm_text_raw_feed 三表下推会丢 25,552 行（publish_time 早于任务 start_date 2020-01-01），禁止入名单；其余 5 张候选（cnthesims_events/ai_research_snapshot/rsshub_raw/tdx_theme_news/ws_asfund）虽探针通过但本轮无需下推，故保持空名单，如需启用须先过黄金对比。",
+       "_note_export_async": "2026-09-28 开启：异步导出绕过服务端单作业 60s 软时间预算。背景=缺陷1 数据修复 full_range 重拉第 126/136 批触发 export_exceeds_time_budget（服务器繁忙时同步 export 耗时 11~14s→突破 60s），且失败后框架层陷入无退避重放空转（事故记录见 docs/evidence/defect1-repair-attempt1-failure-20260928.md）。async_mode 为本仓库既有能力（mcp_adapter.py:383 注释、client.py:813），默认关；开启后 create_export_job 立即返回 job_id，由 get_manifest(await_ready=True) 轮询至 ready，超时/失败均显式抛错，不静默返回半成品。",
+       "_note": "MCP_API_KEY 从环境变量读取（绝不回显），缺失即 fail-fast（见 MCPClient）。main_db 由 daemon 按 data_config.path 注入。upstream_authority=mcp：transport 与上游权威合一（2026-07-21 分离契约随唯一化废止）。"
+     }
+diff --git a/quantstudio/pipeline/mcp/client.py b/quantstudio/pipeline/mcp/client.py
+index f2747ca..e3ed657 100644
+--- a/quantstudio/pipeline/mcp/client.py
++++ b/quantstudio/pipeline/mcp/client.py
+@@ -530,12 +530,18 @@ class MCPClient:
+             raise err[0]
+         return result[0]
+ 
+-    def _call_with_retry(self, fn, *args, **kwargs):
++    def _call_with_retry(self, fn, *args, max_attempts: Optional[int] = None, **kwargs):
+         """幂等请求重试（**总预算有界** + 线程超时包裹 + 退避 + 心跳）。
+ 
+         六步③（2026-09-18）新增：预算 self.retry_budget_sec（0/负=不限=旧行为）。
+         成功路径零变更：预算内的返回值/重试次数/退避序列/请求参数逐项不变；
+         仅当剩余预算不足时收窄 join 与退避，耗尽即抛 MCPRetryBudgetExhausted。
++
++        max_attempts（2026-10-05 passthrough 首轮修复，kw-only，绝不进入服务端
++        payload）：**本次调用**的尝试次数上限；None（默认）= 用 self.retry_max，
++        与本次改动前逐行等效。所有「末次判定」（是否重置连接、是否退避 sleep、
++        终态文案）都按**有效上限** eff_max 计算 ⇒ max_attempts=1 时单次失败
++        不 sleep、不 reset，直接抛终态（零空转）。
+         """
+         last_err: Optional[BaseException] = None
+         budget = self.retry_budget_sec
+@@ -545,7 +551,9 @@ class MCPClient:
+         def _remaining() -> Optional[float]:
+             return None if deadline is None else (deadline - time.monotonic())
+ 
+-        for attempt in range(self.retry_max):
++        eff_max = max(1, int(max_attempts)) if max_attempts else int(self.retry_max)
++
++        for attempt in range(eff_max):
+             rem = _remaining()
+             if rem is not None and rem <= 0:
+                 self._raise_budget_exhausted(t0, budget, attempt, last_err)
+@@ -571,13 +579,13 @@ class MCPClient:
+                 last_err = e
+                 wait = self.backoff_sec[min(attempt, len(self.backoff_sec) - 1)]
+                 logger.warning(
+-                    f"[MCP retry] attempt {attempt + 1}/{self.retry_max} failed: "
++                    f"[MCP retry] attempt {attempt + 1}/{eff_max} failed: "
+                     f"{type(e).__name__}: {e}, sleep {wait}s")
+                 # P3-2 10053 根因修复：server 间歇性断开连接（如 ECONNRESET/10053），
+                 # 重试若复用同一已损坏的 _session 和失效 _session_id 必败。
+                 # 对传输层错误（MCPTransportError/网络异常），重试前重置连接并重握手，
+                 # 使后续重试走全新 session。这不改变任何数据语义/API 契约。
+-                if attempt + 1 < self.retry_max:  # 还有重试机会才重置与退避
++                if attempt + 1 < eff_max:  # 还有重试机会才重置与退避（按本次有效上限）
+                     from .errors import MCPTransportError as _TE
+                     if isinstance(e, (_TE,)) or isinstance(e, requests.RequestException):
+                         try:
+@@ -594,7 +602,7 @@ class MCPClient:
+                         wait = min(wait, rem)
+                     self._sleep_with_heartbeat(wait, "[MCP retry]")
+         raise MCPTransportError(
+-            f"MCP 重试 {self.retry_max} 次仍失败: {last_err}") from last_err
++            f"MCP 重试 {eff_max} 次仍失败: {last_err}") from last_err
+ 
+     # ---------------- 连接重置（重连） ----------------
+     def _reset_connection(self, timeout: Optional[float] = None) -> None:
+@@ -766,8 +774,14 @@ class MCPClient:
+ 
+     def fetch_page(self, dataset_id: str, cursor: str = "",
+                    page_size: int = 50000,
+-                   columns: Optional[List[str]] = None) -> Dict[str, Any]:
+-        """分页取数：cursor 必须为字符串，首页传 ""（实测 null 会校验失败）。"""
++                   columns: Optional[List[str]] = None,
++                   *, max_attempts: Optional[int] = None) -> Dict[str, Any]:
++        """分页取数：cursor 必须为字符串，首页传 ""（实测 null 会校验失败）。
++
++        max_attempts（2026-10-05 passthrough 首轮修复）：仅限**本次调用**的尝试
++        次数上限，kw-only 且**不进入服务端 payload**（由 _call_with_retry 消费）。
++        None（默认）= 与改动前逐行等效。
++        """
+         args: Dict[str, Any] = {
+             "dataset_id": dataset_id,
+             "cursor": cursor if cursor is not None else "",
+@@ -775,7 +789,8 @@ class MCPClient:
+         }
+         if columns:
+             args["columns"] = list(columns)
+-        return self._call_with_retry(self._call_tool, "fetch_page", args)
++        return self._call_with_retry(self._call_tool, "fetch_page", args,
++                                     max_attempts=max_attempts)
+ 
+     def query_updated_since(self, since: str,
+                             table: Optional[str] = None) -> List[Dict[str, Any]]:
+diff --git a/quantstudio/pipeline/sources/mcp_adapter.py b/quantstudio/pipeline/sources/mcp_adapter.py
+index c8e9e6b..27e61f3 100644
+--- a/quantstudio/pipeline/sources/mcp_adapter.py
++++ b/quantstudio/pipeline/sources/mcp_adapter.py
+@@ -36,7 +36,10 @@ import pandas as pd
+ from quantstudio.pipeline.sources.base import BaseSourceAdapter
+ from quantstudio.pipeline.mcp import MCPClient
+ from quantstudio.pipeline.mcp.client import load_mcp_api_key
+-from quantstudio.pipeline.mcp.errors import MCPClientError, MCPToolError
++from quantstudio.pipeline.mcp.errors import (
++    MCPClientError, MCPToolError, MCPAuthError, MCPProtocolError,
++    MCPTransportError, MCPRetryBudgetExhausted, MCPExportBudgetError,
++)
+ from quantstudio.pipeline.qfq_reanchor_schema import aux_db_path
+ from quantstudio.pipeline.code_contract import validate_sec_code
+ 
+@@ -321,6 +324,44 @@ _QFQ_ADJFACTOR_TABLES = {("stock_daily", "daily"), ("etf_daily", "daily"),
+                          ("etf_minutes", "30min"), ("etf_minutes", "60min")}
+ 
+ 
++def _clip_passthrough_dates(df: pd.DataFrame, start: str,
++                            end: str) -> pd.DataFrame:
++    """passthrough 统一口径的客户端日期裁剪（date/trade_date/cal_date 存在时）。
++
++    下推只是性能层，**裁剪才是语义权威**：export 与 fetch_page 两条通道
++    都必须过此函数，保证同口径（2026-10-05 F-1 修复 §3.1.4）。
++    """
++    def _norm_date(v):
++        s = str(v).strip()
++        if len(s) >= 10 and s[4] == "-":
++            s = s[:10].replace("-", "")
++        return s[:8]
++
++    if not len(df):
++        return df
++    date_col = next((c for c in ("date", "trade_date", "cal_date")
++                     if c in df.columns), None)
++    if not date_col:
++        return df
++    dcol = df[date_col].map(_norm_date)
++    s8, e8 = _norm_date(start), _norm_date(end)
++    return df[(dcol >= s8) & (dcol <= e8)].reset_index(drop=True)
++
++
++def _filter_passthrough_codes(df: pd.DataFrame,
++                              codes: Optional[List[str]]) -> pd.DataFrame:
++    """passthrough 统一口径的 codes 过滤（识别 daemon 的 'ALL' 全市场标记）。"""
++    _is_all = codes and (len(codes) == 1 and str(codes[0]).upper() == "ALL")
++    if not codes or _is_all or not len(df):
++        return df
++    want = {str(c) for c in codes}
++    code_col = next((c for c in ("ts_code", "code", "stock_code")
++                     if c in df.columns), None)
++    if not code_col:
++        return df
++    return df[df[code_col].astype(str).isin(want)].reset_index(drop=True)
++
++
+ def _resolve_data_root() -> Path:
+     """解析 Raw Landing 根目录（DATA_ROOT，回退项目 data/）。
+ 
+@@ -392,6 +433,17 @@ class MCPAdapter(BaseSourceAdapter):
+         # 异步导出（服务端已支持 async_mode：立即返回 job_id + status=running）。
+         # 默认关——同步路径行为零影响；开启后由 get_manifest 轮询等待。
+         self.export_async = bool(config.get("export_async", False))
++        # passthrough fetch_page 首页超时 → 自适应降级 export（2026-10-05 F-2 修复）。
++        # 默认 false ⇒ 完全不探测（_fetch_all_pages 传 max_attempts=None），
++        # _fetch_passthrough 与修复前逐行等效（fail-safe 总开关）。
++        self.passthrough_export_fallback = bool(
++            config.get("passthrough_export_fallback", False))
++        # export 窗口下推白名单（元素 = canonical table 名，非 qdb_table）。
++        # 默认空名单 = 全局不下推（fail-safe）；仅 §3.0 探针通过的表由 profile 显式填写。
++        _wl = config.get("passthrough_export_window_tables") or []
++        self.passthrough_export_window_tables = frozenset(str(x) for x in _wl)
++        # 任务级 call_timeout 同步给 client 的桥接值（None = 尚未 configure_execution）
++        self._client_call_timeout: Optional[float] = None
+         # 全局最新因子缓存：{asset_type: {裸码: adj_latest}}；每进程每资产类型只查一次
+         self._adj_latest_cache: Dict[str, Dict[str, float]] = {}
+         # 已执行过冷启动的资产类型（避免同一进程内重复全历史导出）
+@@ -434,10 +486,14 @@ class MCPAdapter(BaseSourceAdapter):
+         if self._client is None:
+             # 修复2：构造时从 config/secrets.env（GUI 写入）读取 API Key 注入，
+             # 不从环境变量隐式依赖，避免 key 泄露到 git 配置。
++            _kw = {}
++            if self._client_call_timeout is not None:
++                _kw["call_timeout"] = float(self._client_call_timeout)
+             self._client = MCPClient(
+                 endpoint=self.endpoint,
+                 tls_verify=self.tls_verify,
+                 api_key=load_mcp_api_key(),
++                **_kw,
+             )
+             # 六步③：首次握手同样按 retry_budget_sec 有界（0/负值 = 不限 = 旧行为）
+             self._client.handshake_bounded()  # 建立 session（initialize→mcp-session-id→notifications/initialized）
+@@ -476,6 +532,26 @@ class MCPAdapter(BaseSourceAdapter):
+         """类别B 同名 passthrough 表判定（不走 aligner/validator/watermark）。"""
+         return table in _PASSTHROUGH_TABLES
+ 
++    def configure_execution(self, task: Dict) -> None:
++        """任务级执行参数贯通（2026-10-05 F-2 修复 §3.3，收窄版）。
++
++        基类语义全保留，仅额外把 **call_timeout** 同步给 MCPClient：
++          - client 未建 → 记桥接值，构造时传入；已建 → 在 client._lock 内更新；
++          - 取值域守卫：<=0 / 不可解析 ⇒ 回退 client 默认 90（禁止 join(0) 陷阱值）；
++          - **不**同步 retry_max / retry_backoff_sec / rate_per_min（量化见 §4.3）。
++        """
++        super().configure_execution(task)
++        try:
++            ct = float(self.call_timeout)
++        except (TypeError, ValueError):
++            ct = 0.0
++        if not (ct > 0):
++            ct = 90.0
++        self._client_call_timeout = ct
++        if self._client is not None:
++            with self._client._lock:  # noqa: SLF001 - 与 client 内部同锁，防并发读改
++                self._client.call_timeout = ct
++
+     # ------------------------------------------------------------------
+     # 核心：fetch_table
+     # ------------------------------------------------------------------
+@@ -537,19 +613,28 @@ class MCPAdapter(BaseSourceAdapter):
+         return raw_df, meta
+ 
+     def _fetch_all_pages(self, dataset_id: str,
+-                         page_size: int = 50_000) -> Tuple[pd.DataFrame, int]:
++                         page_size: int = 50_000,
++                         max_attempts: Optional[int] = None) -> Tuple[pd.DataFrame, int]:
+         """通过已验证的 cursor API 完整拉取一个 MCP 数据集。
+ 
+         服务端 `query_snapshot` 存在 10,000 行硬上限，即使请求更大的 limit
+         也会静默截断；因此所有非 export 管线表都必须通过 fetch_page 分页。
++
++        max_attempts（2026-10-05 passthrough 首轮修复）：**仅作用于首页**探测
++        （后续页恒为 None = 旧行为），供调用方做「首页是否可用」的快速判定。
++        默认 None ⇒ 与改动前逐行等效（其余 4 个调用点不受影响）。
+         """
+         rows: List[Dict] = []
+         cursor = ""
+         seen_cursors = set()
+         pages = 0
++        _first = True
+         while True:
++            # 兼容既有 client 桩：max_attempts 仅在非 None 时透传（None = 旧调用形态）
++            _kw = {} if (max_attempts is None or not _first) else {"max_attempts": max_attempts}
+             payload = self.client.fetch_page(
+-                dataset_id=dataset_id, cursor=cursor, page_size=page_size)
++                dataset_id=dataset_id, cursor=cursor, page_size=page_size, **_kw)
++            _first = False
+             page_rows = payload.get("rows", []) or []
+             rows.extend(page_rows)
+             pages += 1
+@@ -570,25 +655,236 @@ class MCPAdapter(BaseSourceAdapter):
+     # ------------------------------------------------------------------
+     # 类别B passthrough：分页全量取 raw（原样返回，不做任何映射/归一）
+     # ------------------------------------------------------------------
+-    def _fetch_export_passthrough(self, table: str, freq: str,
+-                                    start: str, end: str) -> Tuple[pd.DataFrame, Dict]:
+-        """F-2：宽文本 passthrough 表的 export 路径。
++    # ---- F-2 修复：首页超时族判定（2026-10-05） ----
++    @staticmethod
++    def _is_timeout_family(exc: BaseException) -> bool:
++        """判定「超时族」：MCPRetryBudgetExhausted，或 MCPTransportError 且
++        __cause__/__context__ 链（≤3 层）含 TimeoutError。
+ 
+-        与 _fetch_passthrough 语义一致（原样返回、不映射/不注入 QFQ），
+-        仅拉取通道从 fetch_page JSON 改为 export Parquet 分片。
++        必须按异常链判定：探测走 max_attempts=1，单次 TimeoutError 会被
++        _call_with_retry 包成 MCPTransportError（TimeoutError 在 __cause__）。
+         """
+-        qdb_table = _CANONICAL_TO_QUESTDB.get(table, table)
++        if isinstance(exc, MCPRetryBudgetExhausted):
++            return True
++        if not isinstance(exc, MCPTransportError):
++            return False
++        cur: Optional[BaseException] = exc
++        hops = 0
++        while cur is not None and hops < 3:
++            if isinstance(cur, TimeoutError):
++                return True
++            nxt = cur.__cause__ if cur.__cause__ is not None else cur.__context__
++            if nxt is None or nxt is cur:
++                break
++            cur = nxt
++            hops += 1
++        return False
++
++    # ---- export 窗口下推 / 分片收缩（2026-10-05 F-1 修复，白名单制） ----
++    def _export_window_bounds(self, table: str, start: str,
++                              end: str) -> Tuple[Optional[str], Optional[str]]:
++        """白名单窗口：仅名单内表才下推半开区间 [start, end+1day)。
++
++        名单外 / 日期解析失败 ⇒ 返回 (None, None)（不传窗口，等效旧行为）。
++        默认名单为空 ⇒ 全局不下推（fail-safe）。
++        """
++        wl = getattr(self, "passthrough_export_window_tables", None) or frozenset()
++        if table not in wl:
++            return (None, None)
++        try:
++            ts_iso = datetime.strptime(
++                str(start).strip()[:10], "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00")
++            te_iso = (datetime.strptime(str(end).strip()[:10], "%Y-%m-%d")
++                      + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
++        except (TypeError, ValueError) as e:
++            logger.warning(f"[MCPAdapter] {table} 窗口解析失败，本次不下推窗口: {e}")
++            return (None, None)
++        return (ts_iso, te_iso)
++
++    def _export_once(self, table: str, qdb_table: str,
++                     ts: Optional[str], te: Optional[str],
++                     async_mode: bool) -> pd.DataFrame:
++        """单次 export（父窗或子窗），落 Raw Landing 后读回。"""
+         arts = self.client.export_dataset(
+             dataset_id=qdb_table, page_size=50_000,
+-            time_start=None, time_end=None, row_limit=None)
++            time_start=ts, time_end=te, row_limit=None,
++            async_mode=async_mode)
+         frames = []
+         for art in arts:
+-            local = self._landing_path(f"pt_export_{table}", art.artifact_id.replace("/", "_"))
++            local = self._landing_path(f"pt_export_{table}",
++                                       art.artifact_id.replace("/", "_"))
+             local.write_bytes(art.parquet_bytes)
+             frames.append(pd.read_parquet(local))
+-        raw_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+-        meta = {"fetch_mode": "export_wide_text", "pages": len(arts),
+-                "rows": len(raw_df)}
++        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
++
++    def _export_subwindow(self, table: str, qdb_table: str,
++                          ts: str, te: str,
++                          async_mode: bool) -> Tuple[pd.DataFrame, int]:
++        """子窗 export：返回 (DataFrame, 服务端 manifest 申报行数)。
++
++        与 _export_once 的区别是显式取 manifest.total_rows，供聚合断言
++        （sum(子窗 rows) == len(concat)）核对，防止重叠/漏窗被静默接受。
++        """
++        ref = self.client.create_export_job(
++            dataset_id=qdb_table, page_size=50_000,
++            time_start=ts, time_end=te, row_limit=None, async_mode=async_mode)
++        manifest = self.client.get_manifest(ref, await_ready=async_mode)
++        frames = []
++        for shard in manifest.shards:
++            art = self.client.get_artifact(ref, shard.artifact_id)
++            local = self._landing_path(f"pt_export_{table}",
++                                       art.artifact_id.replace("/", "_"))
++            local.write_bytes(art.parquet_bytes)
++            frames.append(pd.read_parquet(local))
++        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
++        return df, int(manifest.total_rows or 0)
++
++    @staticmethod
++    def _parse_suggested_shards(raw: object, ts: str,
++                                te: str) -> Optional[List[Tuple[str, str]]]:
++        """校验服务端 suggested_shards：非空、可解析、两两不交且并集覆盖父窗。
++
++        任一条件不满足 ⇒ 返回 None（调用方回落父窗二分）。
++        """
++        if not isinstance(raw, (list, tuple)) or not raw:
++            return None
++
++        def _iso(v) -> Optional[str]:
++            s = str(v).strip()[:19]
++            if len(s) == 8 and s.isdigit():
++                s = f"{s[:4]}-{s[4:6]}-{s[6:8]}T00:00:00"
++            try:
++                return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00")
++            except (TypeError, ValueError):
++                return None
++
++        out: List[Tuple[str, str]] = []
++        for item in raw:
++            if isinstance(item, dict):
++                a, b = _iso(item.get("time_start")), _iso(item.get("time_end"))
++            elif isinstance(item, (list, tuple)) and len(item) == 2:
++                a, b = _iso(item[0]), _iso(item[1])
++            else:
++                return None
++            if a is None or b is None or a >= b:
++                return None
++            out.append((a, b))
++        # 两两不交
++        srt = sorted(out)
++        for i in range(1, len(srt)):
++            if srt[i][0] < srt[i - 1][1]:
++                return None
++        # 并集覆盖父窗
++        if srt[0][0] > ts or srt[-1][1] < te:
++            return None
++        for i in range(1, len(srt)):
++            if srt[i][0] != srt[i - 1][1]:
++                return None
++        return srt
++
++    @staticmethod
++    def _bisect_window(ts: str, te: str, depth: int = 5,
++                       max_jobs: int = 16) -> List[Tuple[str, str]]:
++        """父窗二分：返回两两不交且覆盖父窗的子窗列表（深度≤5、子作业≤16）。"""
++        subs = [(ts, te)]
++        for _ in range(max(0, int(depth))):
++            if len(subs) >= max_jobs:
++                break
++            nxt: List[Tuple[str, str]] = []
++            for (a, b) in subs:
++                try:
++                    da = datetime.strptime(a[:10], "%Y-%m-%d")
++                    db = datetime.strptime(b[:10], "%Y-%m-%d")
++                except (TypeError, ValueError):
++                    nxt.append((a, b))
++                    continue
++                if (db - da).days <= 1:
++                    nxt.append((a, b))
++                    continue
++                mid = da + timedelta(days=(db - da).days // 2)
++                m_iso = mid.strftime("%Y-%m-%dT00:00:00")
++                if m_iso <= a or m_iso >= b:
++                    nxt.append((a, b))
++                    continue
++                nxt.append((a, m_iso))
++                nxt.append((m_iso, b))
++            if len(nxt) > max_jobs or not nxt:
++                break
++            subs = nxt
++        return subs
++
++    def _fetch_export_passthrough(self, table: str, freq: str,
++                                    start: str, end: str) -> Tuple[pd.DataFrame, Dict]:
++        """本轮 F-1 / 历史 F-2（宽文本路由）：passthrough 表的 export 路径。
++
++        与 _fetch_passthrough 语义一致（原样返回、不映射/不注入 QFQ），
++        仅拉取通道从 fetch_page JSON 改为 export Parquet 分片。
++
++        2026-10-05 修复三项（均为纯增益错误/机制层，成功路径不变）：
++          1. async_mode 贯通（配置 export_async，默认 False = 旧行为）；
++          2. 窗口下推：仅白名单内表下推半开区间（默认空名单 = 不下推）；
++          3. MCPExportBudgetError 消费：仅名单内（本次实际携带窗口）才消费
++             suggested_shards 或按父窗二分；非名单表直接上抛。
++        """
++        qdb_table = _CANONICAL_TO_QUESTDB.get(table, table)
++        async_mode = bool(getattr(self, "export_async", False))
++        ts, te = self._export_window_bounds(table, start, end)
++        subjobs = 0
++        try:
++            raw_df = self._export_once(table, qdb_table, ts, te, async_mode)
++        except MCPExportBudgetError as e:
++            if ts is None:
++                # 非名单表（本次未携带窗口 ⇒ 无父窗 ⇒ 无子窗/二分可能）：
++                # 不消费 suggested_shards、不做二分，直接上抛（与修复前一致）。
++                logger.error(
++                    f"[MCPAdapter] {table} export 撞服务端预算错误，且该表不在 "
++                    f"passthrough_export_window_tables 白名单（无父窗可收缩），"
++                    f"按修复前语义上抛: {e}")
++                raise
++            logger.warning(
++                f"[MCPAdapter] {table} export 预算错误，按白名单窗口收缩重取: {e}")
++            shards = self._parse_suggested_shards(e.suggested_shards, ts, te)
++            if shards is None:
++                shards = self._bisect_window(ts, te, depth=5, max_jobs=16)
++                logger.warning(
++                    f"[MCPAdapter] {table} suggested_shards 不可用/无效，"
++                    f"回落父窗二分（{len(shards)} 个子窗）")
++            frames = []
++            reported = 0
++            for (a, b) in shards:
++                sub_df, sub_rows = self._export_subwindow(
++                    table, qdb_table, a, b, async_mode)
++                reported += sub_rows
++                frames.append(sub_df)
++            subjobs = len(shards)
++            raw_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
++            # 聚合断言（M-6）：服务端申报行数与实收行数必须一致，否则先按全列
++            # 去重一次；仍不等 ⇒ 上抛且禁止写入（全量覆盖语义下重复行=污染）。
++            if reported != len(raw_df):
++                logger.warning(
++                    f"[MCPAdapter] {table} 分片聚合不一致 "
++                    f"（sum={reported} vs concat={len(raw_df)}），全列去重重试")
++                raw_df = raw_df.drop_duplicates().reset_index(drop=True)
++                if reported != len(raw_df):
++                    raise MCPClientError(
++                        f"[MCPAdapter] {table} 分片聚合断言失败且去重后仍不一致"
++                        f"（sum={reported} vs concat={len(raw_df)}），禁止写入")
++        # 0 行守卫（m-2）：仅当本次**实际携带窗口**且结果 0 行时才单次回落，
++        # 防「下推 0 行 = CREATE OR REPLACE 清空表」；未下推时的 0 行是合法空表。
++        if ts is not None and len(raw_df) == 0:
++            logger.warning(
++                f"[MCPAdapter] {table} 带窗 export 返回 0 行，单次回落无窗重取")
++            raw_df = self._export_once(table, qdb_table, None, None, async_mode)
++        # 语义对齐：客户端日期裁剪与 _fetch_passthrough 同口径（裁剪是权威）。
++        raw_df = _clip_passthrough_dates(raw_df, start, end)
++        meta = {"fetch_mode": "export_wide_text", "rows": len(raw_df),
++                "source": "mcp", "freq": freq, "table": table,
++                "passthrough": True, "wide_text_export": True,
++                "async": async_mode, "window": bool(ts is not None),
++                "subjobs": subjobs,
++                "lineage": {"transport": "mcp_export_parquet",
++                            "server": self.endpoint,
++                            "async": async_mode, "subjobs": subjobs}}
+         return raw_df, meta
+ 
+     def _fetch_passthrough(self, table: str, freq: str, start: str, end: str,
+@@ -601,26 +897,66 @@ class MCPAdapter(BaseSourceAdapter):
+         - 不触发 §7.2-A QFQ 注入
+         """
+         qdb_table = _CANONICAL_TO_QUESTDB.get(table, table)
+-        df, page_count = self._fetch_all_pages(qdb_table)
+-        # 仅做日期窗口裁剪（不改变列），MCP 列名可能是 date/trade_date
+-        def _norm_date(v):
+-            s = str(v).strip()
+-            if len(s) >= 10 and s[4] == "-":
+-                s = s[:10].replace("-", "")
+-            return s[:8]
+-        date_col = next((c for c in ("date", "trade_date", "cal_date") if c in df.columns), None)
+-        if len(df) and date_col:
+-            dcol = df[date_col].map(_norm_date)
+-            s8, e8 = _norm_date(start), _norm_date(end)
+-            df = df[(dcol >= s8) & (dcol <= e8)].reset_index(drop=True)
+-        # codes 过滤（识别 daemon 的 'ALL' 全市场标记，跳过过滤）
+-        _is_all = codes and (len(codes) == 1 and str(codes[0]).upper() == "ALL")
+-        if codes and not _is_all and len(df):
+-            want = {str(c) for c in codes}
+-            code_col = next((c for c in ("ts_code", "code", "stock_code")
+-                             if c in df.columns), None)
+-            if code_col:
+-                df = df[df[code_col].astype(str).isin(want)].reset_index(drop=True)
++        # 开关 false ⇒ 传 None（完全不探测，与修复前逐行等效）
++        # getattr 兜底：裸实例（绕过 __init__ 的既有测试桩）默认 false = 修复前语义
++        probe_attempts = (1 if getattr(self, "passthrough_export_fallback", False)
++                          else None)
++        try:
++            df, page_count = self._fetch_all_pages(qdb_table,
++                                                   max_attempts=probe_attempts)
++        except (MCPAuthError, MCPProtocolError):
++            # 鉴权/协议错误：不可重试、不降级，原样上抛（与旧语义一致）
++            raise
++        except MCPTransportError as e:
++            if not getattr(self, "passthrough_export_fallback", False):
++                raise
++            if not self._is_timeout_family(e):
++                # 其余传输错误（ECONNRESET/10053、非 2xx）：不降级，
++                # 以 max(1, retry_max-1) 重发（总尝试次数与修复前一致，保留重连自愈）
++                logger.warning(
++                    f"[MCPAdapter] {table} 首页非超时传输错误，重发"
++                    f"（max_attempts={max(1, int(getattr(self.client, 'retry_max', 5)) - 1)}）: {e}")
++                df, page_count = self._fetch_all_pages(
++                    qdb_table,
++                    max_attempts=max(1, int(getattr(self.client, "retry_max", 5)) - 1))
++            else:
++                # 首页超时族（含 MCPRetryBudgetExhausted）⇒ 自适应降级 export
++                logger.warning(
++                    f"[MCPAdapter] {table} fetch_page 首页超时，降级 export 通道: {e}")
++                try:
++                    df, fb_meta = self._fetch_export_passthrough(
++                        table, freq, start, end)
++                except Exception as fb:  # noqa: BLE001
++                    raise MCPTransportError(
++                        f"[MCPAdapter] {table} export 降级失败"
++                        f"（首页超时: {e}）: {type(fb).__name__}: {fb}") from fb
++                # 降级结果按 _fetch_passthrough 同口径做日期裁剪 + codes 过滤
++                df = _clip_passthrough_dates(df, start, end)
++                df = _filter_passthrough_codes(df, codes)
++                meta = {
++                    "source": "mcp",
++                    "freq": freq,
++                    "table": table,
++                    "fetch_mode": "export_fallback",
++                    "passthrough": True,
++                    "upstream_authority": "xtquant",
++                    "fallback_reason": f"{type(e).__name__}: {e}",
++                    "export_meta": fb_meta,
++                    "lineage": {
++                        "upstream_authority": "xtquant",
++                        "transport": "mcp_export_parquet",
++                        "server": self.endpoint,
++                        "passthrough": True,
++                        "fallback_from": "fetch_page",
++                    },
++                    "rows": len(df),
++                }
++                logger.info(f"[MCPAdapter] {table}/{freq} 降级 export 拉取 {len(df)} 行")
++                return df, meta
++        # 兜底（m-3）：未经 _call_with_retry 包装的异常（如 cursor 不前进的
++        # ValueError）不在此捕获 ⇒ 不降级，按既有语义上抛。
++        df = _clip_passthrough_dates(df, start, end)
++        df = _filter_passthrough_codes(df, codes)
+         meta = {
+             "source": "mcp",
+             "freq": freq,
+
+diff --git a/docs/mcp-passthrough-first-pull-export-fix-design.md b/docs/mcp-passthrough-first-pull-export-fix-design.md
+new file mode 100644
+index 0000000..0e6afba
+--- /dev/null
++++ b/docs/mcp-passthrough-first-pull-export-fix-design.md
+@@ -0,0 +1,394 @@
++# 修复方案 v4：MCP-only 采集 passthrough 首轮全量拉取失败（F-1/F-2）——六步流水线·步骤 1（第四版，审计收口）
++
++- 方案日期：2026-10-05（v4 定稿：2026-10-05 02:53；v3→v4 响应定点复核 R-1~R-7）
++- 审计链：v1 → 审计 `docs/audit-mcp-passthrough-first-pull-export-fix-20261005.md`（M1–M9/S1–S10）
++  → v2 → 复审 `docs/reaudit-mcp-passthrough-first-pull-export-fix-v2-20261005.md`
++  （❌ 2 严重 + 7 中等 + 6 轻微）→ v3 → 定点复核
++  `docs/recheck-mcp-passthrough-fix-v3-20261005.md`（⚠️ 有条件通过：补 R-1 即放行，无需再复审）
++- 依据复盘：`output/mcp_only_collector_run_20261004_214251/failure_review.md`
++- 适用铁律：框架层改动六步流水线；「框架问题立即解决」；「全链路修复仅限框架层·纯增益」；
++  「性能优化不得改变引擎行为」；MCP 全数据源替代任务进度报告实时更新。
++- **v4 状态：步骤 1 修订完成；步骤 2 审计收口（有条件通过，R-1 已补 + R-2~R-7 同批修订）；**
++  **步骤 3（实施）已解锁，待启动。**
++
++> **v4 修订总览**（本轮 R-1~R-7）：R-1（分片收缩 = 窗口下推的一种形式，仅白名单内表可用，
++> 非名单表 budget error 直接上抛 + 父窗定义 + §5.1 用例）；R-2（「三分支」→「五出口」措辞）、
++> R-3（兜底举例分类更正）、R-4（裁剪/meta 影响点补列）、R-5/R-6（重连次数与尝试次数口径量化）、
++> R-7（名单元素命名）同批修订。
++> v2→v3 修订（B1 三处写死、B2 白名单制、M-1~M-7、m-1~m-7）全部保留生效。
++
++---
++
++## 1. 问题定义
++
++2026-10-04 21:42 → 2026-10-05 01:46 的 mcp_only 采集跑批（库内 88 任务，启用 74）2 任务失败：
++
++| 失败任务 | 目标表 | 取数通道 | 直接错误 |
++|---|---|---|---|
++| F-1 `mcp_llm_text_events_enriched_pt` | `llm_text_events_enriched` | export Parquet（宽文本路径） | `MCPExportBudgetError: export_exceeds_time_budget`（服务端 60s 软预算） |
++| F-2 `mcp_ws_asfund_pt` | `ws_asfund` | fetch_page cursor 分页 | `MCPTransportError: MCP 重试 5 次仍失败: _call_tool 超过 89.5s 未返回`（`__cause__`=TimeoutError，~900s 由 `DEFAULT_RETRY_BUDGET_SEC=900.0` 封顶） |
++
++共性：passthrough 表首次全量拉取（`last_watermark=None`），请求体量是「整表」；两条通道都没把
++「时间窗口 / 异步导出 / 分片收缩」贯通到服务端。两任务均未到写入阶段，DB 未被污染。
++已排除环境问题（handshake ok，同窗口 72 任务正常）与依赖问题（ConfigLint 0 错误 0 警告）。
++
++---
++
++## 2. 根因定位（审计确认成立；锚点复核有效，他人 +33 行在 :2267 之后不污染）
++
++### R1 —— F-1：export 宽文本路径三处未贯通（`mcp_adapter.py:573-592`）
++1. 未传 `async_mode`（`:581-583`）；`export_async` 配置仅 `:1228/:1619/:1926` 三处被读，宽文本路径不在其中；
++2. `time_start/time_end/row_limit` 全 None，服务端整表同步导出撞 60s 软预算；
++3. `MCPExportBudgetError`（`errors.py:74-91`，含 `hint/suggested_shards`）在宽文本路径无任何 `except`。
++
++### R2 —— F-2：fetch_page 无服务端过滤下推 + 超时无退避通道（`mcp_adapter.py:594-642`）
++1. `:604` `_fetch_all_pages(qdb_table)` 无过滤；日期裁剪是拉完后的客户端后置（`:605-615`），
++   服务端首页扫全表 >90s；
++2. `call_timeout=90s`（`client.py:265`）固定；5 次重试纯重复超时，总耗时由
++   `DEFAULT_RETRY_BUDGET_SEC=900.0`（`client.py:173`）封顶；
++3. `ws_asfund` 不在 `_WIDE_TEXT_PASSTHROUGH`，无 export 退避通道。
++   **残余风险（S9）**：R2.1（fetch_page 通道本身无服务端过滤下推）在本方案中**不直接修复**，
++   export 不可用的数据集仍会撞 R2.1——见 §3.2 降级与 §4.4 残余风险声明。
++
++### R3 —— 共性：任务级执行参数未贯通 MCPClient（`mcp_adapter.py:432-444`）
++client 惰性构造只传 `endpoint/tls_verify/api_key`；`base.py:79-106` 的
++`retry_max/retry_backoff_sec/call_timeout/rate_limiter` 在 mcp_adapter 内 0 引用（死参数）。
++**本方案处置（M3/M4/M9）**：本方案仅贯通 `call_timeout`（机制层），不贯通 retry/backoff/rate
++——量化理由见 §4.3。R3 不是 F-2 的解法（F-2 由 §3.2 降级解决），而是独立小修。
++
++---
++
++## 3. 修复方案（改动范围）
++
++改动文件（框架层，策略源码零改动）：
++
++| 文件 | 改动 |
++|---|---|
++| `quantstudio/pipeline/sources/mcp_adapter.py` | 主改动（3.1 + 3.2 + 3.3） |
++| `quantstudio/pipeline/mcp/client.py` | `_call_with_retry` / `fetch_page` 增加 `max_attempts`（kw-only，置于 `*args` 后，S3）；**`:580` 与 `:589-595` 末次跳退避判定改用「本次调用有效 attempts 上限」**（M-2） |
++| `config/profiles/mcp_only/sources_config.json` | 新增 2 个显式回退键（§3.4），`export_async: true` 不动 |
++| `tests/test_mcp_passthrough_export_fallback.py` | 新增测试 |
++| `docs/evidence/mcp-passthrough-window-pushdown-probe-*.md` | 探针证据（§3.0，准入前置） |
++| `collector_tasks.json` | **不改**（M9 选②：0 任务配置变更） |
++| `README.md` + 引用文档 | 验收后同步（见 §7） |
++
++### 3.0 实施步骤 0（M6 准入探针，先于任何代码改动，只读；对象与 B2 白名单一致）
++- 用**临时脚本**（不落库、不进 git；复用既有 `MCPAdapter.client.export_dataset` 能力）对
++  以下 8 张表做「带窗口 vs 不带窗口」双跑导出（异步）：7 张宽文本表 + `ws_asfund`
++  （即 §3.4 白名单的**初始候选**；宽文本表是 export 常驻路径，`ws_asfund` 是降级首触发者）。
++  带窗口 = `[start_date, (跑批日+1天)T00:00:00)` 半开 ISO（与 `mcp_adapter.py:1213-1214`
++  同口径，m-5）；不带窗口 = 全表；两者都经与 `_fetch_passthrough` 同口径的客户端日期裁剪后
++  比对行数。
++- **准入判据（逐表，M-5）**：该表「带窗口行数 == 不带窗口行数」（裁剪后）→ 该表列入
++  `passthrough_export_window_tables` 名单；不等（或 0 行 / 无日期列）→ 该表**不列入**名单，
++  永不窗口下推（仅 async，且不做分片收缩——分片收缩同为窗口下推的一种形式，
++  R-1）。逐表结果**持久化方式 = 名单本身**（无其他运行时状态）。
++- 证据落盘 `docs/evidence/`；探针不通过的表**不阻塞**其余修复（async 贯通 + 降级通道不受影响）。
++
++### 3.1 修复 1（F-1 主修复）：export 宽文本路径贯通（异步 + 白名单窗口 + 分片收缩）
++
++`_fetch_export_passthrough(table, freq, start, end)`（历史注释中的「F-2 路径」统一改称
++「本轮 F-1 / 历史 F-2（宽文本路由）」，S8）：
++
++1. **异步贯通**：`async_mode=bool(self.export_async)`（配置已 true；默认 False=旧行为）→
++   `get_manifest(await_ready=True)` 轮询（client 既有能力）；
++2. **窗口下推（白名单制，B2/M-5/M-7）**：**仅当** `table ∈ passthrough_export_window_tables`
++   （配置名单，代码默认**空** = 全局不下推 = fail-safe）时，才把 `start/end` 按
++   `_fetch_export_direct` 同口径转 ISO 半开区间（`start→YYYY-MM-DDT00:00:00`，`end+1day`）
++   传入 `export_dataset`；不在名单 / 解析失败 → 不传（等效旧行为，记 WARNING）。
++   **降级路径（§3.2）同样只对名单内表下推窗口——未探表一律不下推**；
++3. **预算错误消费（M8 半开不变量；R-1 白名单门控）**：捕获 `MCPExportBudgetError` →
++   **分片收缩（`suggested_shards` 消费 / 二分）视为窗口下推的一种形式，同样要求
++   `table ∈ passthrough_export_window_tables`（本次请求实际携带窗口、父窗存在）才可用**；
++   **非名单表触发 budget error → 不消费 `suggested_shards`、不做二分，直接上抛**
++   （与 §6.1 M-4「修复前必失败」判定一致）。
++   名单内：子窗来源二选一——`suggested_shards` 有效（列表非空、各窗可解析、归一为半开区间后
++   **两两不交且并集覆盖父窗**）则用之；否则按父窗二分（深度上限 5、子作业上限 16）。
++   **父窗定义（R-1）**：名单内 = 本次请求的 `[start, end+1day)` 半开窗口；非名单 = 无父窗
++   （本次请求未携带窗口），故不存在任何子窗/二分可能。
++   逐子窗异步重取；**聚合断言失败动作（M-6）**：`sum(各子窗 rows) != concat 后 rows`
++   ⇒ 先按**全列去重**重试一次；仍不等 ⇒ **上抛并禁止写入**（不得落库，全量覆盖语义下
++   静默写重复行 = 数据污染）；相等 ⇒ 正常聚合；
++4. **语义对齐**：concat 后按 `_fetch_passthrough` 同口径客户端日期裁剪
++   （`date/trade_date/cal_date` 列存在时）——裁剪是**语义权威**，下推只是性能层；
++5. **0 行守卫（M6② / m-2）**：**仅当本次请求实际携带了 `time_start/time_end`** 且结果 0 行时，
++   WARNING + **单次**回落不带窗口重取（防「下推 0 行 = CREATE OR REPLACE 清空表」）；
++   回落结果仍 0 行 → 视为真空窗正常返回；未下推时的 0 行是合法空表，**不**触发回落；
++6. meta 补齐（S2）：`source/freq/table/fetch_mode/passthrough/wide_text_export/async/window/
++   subjobs/rows/lineage`；
++7. `export_wide_text=False` 回落 fetch_page 的既有路由不变。
++
++### 3.2 修复 2（F-2 主修复）：passthrough fetch_page 首页超时自适应降级 export
++
++**总开关语义（B1，写死）**：`passthrough_export_fallback=false` ⇒ `_fetch_all_pages` 传
++`max_attempts=None`（**完全不探测**），本小节步骤 1 全部出口（五出口，R-2）均不生效，
++`_fetch_passthrough` 与修复前**逐行等效**（§3.4 表、§6.1 与此处三处一致）。
++
++异常契约（M1，审计确认准确）：
++- 探测经 `_call_with_retry(..., max_attempts=1)` 执行；单次超时 `TimeoutError` 被
++  `client.py:570` 捕获进重试，循环结束走 `client.py:596` 抛
++  `MCPTransportError(…) from last_err` —— adapter 层看到 `MCPTransportError`，
++  `TimeoutError` 在 `__cause__` 链；预算耗尽直接抛 `MCPRetryBudgetExhausted`
++  （`client.py:564-566` 上抛不包裹）。
++- 判定函数 `_is_timeout_family(exc)`：`isinstance(exc, MCPRetryBudgetExhausted)` 为真；
++  或 `isinstance(exc, MCPTransportError)` 且 `__cause__/__context__` 链（≤3 层）存在 `TimeoutError`。
++- **单测必须用真实异常链构造**（模拟 `_call_with_retry` 终态），禁止手写 TimeoutError 冒充。
++
++**零空转（M-2）**：`client.py:580` 与 `:589-595` 必须改为按**本次调用的有效 attempts 上限**
++（`eff_max = max_attempts or self.retry_max`）判定——`max_attempts=1` 探针单次失败后
++**不 sleep、不 reset**，直接抛终态异常（单测断言：`max_attempts=1` 路径总 sleep == 0）。
++
++流程（`_fetch_passthrough` 内部，开关为 true 时；**探测仅覆盖首页**，S4）：
++
++1. `_fetch_all_pages(qdb_table, max_attempts=1)`（新可选参，仅 `:604` 传 1；M7）：
++   - 首页成功 → 后续页沿用旧行为（`max_attempts=None` → 本次调用有效上限 = client
++     `retry_max`，与修复前逐行一致，**有意为之防外溢**，S4）；
++   - `MCPAuthError` / `MCPProtocolError` → 原样上抛（不降级、不重试，与旧语义一致）；
++   - `_is_timeout_family` 为真 → **降级 export**（步骤 2），不空转重试；
++   - 其余 `MCPTransportError`（ECONNRESET/10053、非 2xx，M2）→ **不降级**，
++     以 `max_attempts=max(1, client.retry_max-1)` 重发（m-4：`retry_max==1` 时夹取为 1，
++     防 `range(0)` 零次尝试 + `last_err=None`；保留重连自愈，总尝试次数 = 修复前 5 次）；
++   - **兜底（m-3/R-3）**：未经 `_call_with_retry` 包装的异常（如 `_fetch_all_pages:561-563`
++     cursor 不前进 `ValueError`，在 `_call_with_retry` 之外抛出）**不降级，按既有语义上抛**；
++     注：`MCPToolError` 经 `_call_with_retry` 重试后会包装成 `MCPTransportError`
++     （`client.py:596`），实际落入上一「其余传输错误 → 重发」分支，不进入兜底；
++2. 降级 = 复用 3.1 的 export 实现（异步 + 白名单窗口 + 分片收缩 + 0 行守卫），
++   meta `fetch_mode="export_fallback"`；**窗口下推仅对 §3.4 名单内表生效（B2）**；
++3. 降级结果按 `_fetch_passthrough` 同口径做日期裁剪 **与 codes 过滤**（S1：codes 非
++   ALL 时 WARNING 后同口径过滤——当前全部 passthrough 任务（69 库内 / 57 启用）codes 均
++   `["ALL"]`，无实际差异）；
++4. 降级也失败 → 上抛降级路径错误，日志合并保留首页超时原始错误（`__cause__` 链）；
++5. **成功路径零改动**：首页一次成功的表（当前走 fetch_page 的 62 张 passthrough 表实际状态）
++   调用序列/返回/语义不变——修复只对「首页真超时」的表生效。
++
++### 3.3 修复 3（R3 收窄版，M3/M4/M9/S7）：仅贯通 `call_timeout` 机制，零任务配置变更
++
++1. `MCPAdapter` 覆写 `configure_execution(task)`：调用 `super()` 后，仅把
++   **`call_timeout`** 同步给 client（client 未建 → 构造时传入；已建 → client `_lock` 内更新）：
++   - 取值域守卫（S7）：`<=0` → 回退 client 默认 90（禁止 `join(0)` 陷阱值）；
++   - **不同步** `retry_max / retry_backoff_sec / rate_per_min`（M3/M4，量化见 §4.3）；
++2. `collector_tasks.json` **0 任务配置变更**（M9 选②）：当前 0/88 任务含 `call_timeout` 键 →
++   本修复落地后行为**逐位不变**，仅兑现「任务级 call_timeout 从此可配」的机制能力；
++   F-2 的解决完全依赖 3.2 降级，不依赖放大超时；
++3. 共用 client 的 `MCPUpdateDetector`（`daemon.py:2518`，S10）：因无任务配置 `call_timeout`，
++   探测器路径行为不变（影响面见 §4.3）。
++
++### 3.4 配置层（显式回退键，M5/B2/M-7）
++
++| 键 | 默认 | 语义 |
++|---|---|---|
++| `export_async`（既有） | true（profile 已设） | 异步导出总开关 |
++| `passthrough_export_fallback`（新增） | true | 3.2 降级总开关；**false = `max_attempts=None` 完全不探测，`_fetch_passthrough` 与修复前逐行等效（B1）** |
++| `passthrough_export_window_tables`（新增，**取代 v2 的布尔键**） | `[]`（空名单，代码默认**不下推**，fail-safe，M-7） | 窗口下推**白名单**（B2）：仅名单内表下推窗口；**分片收缩（suggested_shards/二分）同为窗口下推，仅名单内表可用；非名单表触发 budget error 直接上抛（R-1）**。**名单元素 = canonical `table` 名**（`fetch_table` 入参，非 `_CANONICAL_TO_QUESTDB` 映射后的 `qdb_table`，R-7）；名单 = §3.0 探针通过的表，由 profile 显式填写；未列名单一律不下推（仅 async） |
++
++---
++
++## 4. 影响面
++
++### 4.1 允许改动范围
++- 仅 §3 改动文件表所列；不改 `daemon.py`（`configure_execution` 已在 fetch 前调用
++  `:984`，start/end 已透传）；不改策略源码；不改服务端；不改 passthrough 全量覆盖语义；
++- 不改 `call_timeout` 客户端默认值（90s）、不改 client 默认 retry/backoff/rate 序列
++  （`max_attempts=None` 时逐行等效）。
++
++### 4.2 行为影响点（必须验收盯住；数字口径 M-1）
++- 库内 88 任务 / 启用 74；passthrough 69（启用 57）；其中 **7 张宽文本走 export 通道**；
++  **走 fetch_page 的 passthrough 表 = 62 张（库内）/ 50 张（跑批口径）**；
++1. **7 张宽文本表**（含 6 张已成功表 + `enriched`）：export 调用变为「异步」；窗口下推
++   仅对 §3.4 名单内表生效（名单 = 探针通过的表，探针准入判据 = 行数等价，§5.4 硬性前置）；
++   **另两项成功路径新行为（R-4，现行 `:584-592` 均无）**：§3.1.4 客户端日期裁剪（与
++   `_fetch_passthrough` 同口径）与 §3.1.6 meta 补齐——由 §5.5 黄金对比盯住；
++2. **62 张 fetch_page passthrough 表（跑批 50）**：开关 true 时首页新增 1 次
++   `max_attempts=1` 探测；首页成功 → 后续完全旧语义；首页真超时 → 降级（当前仅 `ws_asfund`
++   实证触发）；开关 false → 完全不探测，逐行等效修复前（B1）；
++3. **4 个无关调用点零外溢**（M7）：`_fetch_all_pages` 的 `:652/:2137/:2158/:2179`
++   调用点签名/序列不变（回归断言锁定）。
++
++### 4.3 量化行为差异清单（M-2 已定稿为确定性数值）
++
++| 项 | 修订前（v2 方案） | 修订后（v4 定稿） | 差异说明 |
++|---|---|---|---|
++| `rate_per_min` 同步 | 已剔除 | **剔除（不变）** | 若同步：client 200/min → 85 任务 30/min、分钟表 1/min、broker_recommend 26/min，`_acquire_rate()` 每次调用前执行 → 成功路径限速 + 影响共用 client 的 `MCPUpdateDetector`。剔除后零变化 |
++| retry/backoff 同步 | 已剔除 | **剔除（不变）** | 若同步：88/88 任务显式 `backoff_sec=[60,120,240,480,960]` 改写 client 默认 `(30,60,120,240,480)`，失败路径退避拉长。剔除后逐位一致 |
++| `call_timeout` 同步 | 保留（仅此项） | **保留（仅此项）** | 0/88 任务配置该键 → 落地后行为逐位不变；`<=0` 守卫回退 90 |
++| 首页探测 | 新增 1 次（69 表） | **开关门控 + 零 sleep（62 表）** | 开关 true：首页成功 → 无差异；首页超时 → 降级（旧=900s 后失败，新=降级成功）；首页非超时传输错误 → 重发 `max(1, retry_max-1)`，总尝试 5 次不变、重连自愈保留；**探针零 sleep（:580 改有效上限后，确定性 0s）**。开关 false：完全不探测，逐行等效 |
++| 非超时传输错误退避（确定性，M-2） | 「时延微调」不可判定 | **定稿**：重发分支总退避 = `backoff[0..2]`=30+60+120=**210s**（4 次尝试：末次无 sleep）；修复前同场景 = `backoff[0..3]`=30+60+120+240=**450s**（5 次尝试）。仅失败路径时延差异，成功路径不变，测试锁定。**重连次数由 4 次降为 3 次**（探针与末次在新判定下均不 `_reset_connection`，R-5）；**「总尝试次数 5 次不变」仅在 `retry_max=5`（当前全部任务）下成立**，`retry_max=1` 时新逻辑为 1+1=2 次（R-6） |
++| 宽文本 export | 异步；窗口布尔键默认 true | **异步；窗口白名单默认空（fail-safe）** | 名单外（未探表）一律不下推；数据行数必须与 2026-10-04 黄金一致（§5.4/§5.5） |
++
++### 4.4 残余风险声明（S9）
++- fetch_page 通道本身仍无服务端过滤下推（R2.1 未直接修复）：若某数据集 export 不可用且
++  首页 >90s，任务仍会失败——由 3.2 降级覆盖可 export 的数据集，残余场景留待
++  「任务级 `call_timeout`」机制（3.3）未来按任务放窗，不在本次范围。
++- **F-2 降级路径残余（步骤 3 追加，V-3）**：`ws_asfund` 探针实测通过
++  （42,974 == 42,974），但本轮名单保持空（fail-safe，见探针证据 §4）⇒
++  `ws_asfund` **未进白名单**，其 §3.2 降级 export 不带窗口；若降级后仍撞
++  `MCPExportBudgetError`（非名单表 ⇒ 按 §3.1.3 不消费 `suggested_shards`、
++  不二分、直接上抛），则**停止推进**，按 §6.3 触发回退判据第 4 项
++  （F-2 复验仍失败）**回退并上报**，不得改白名单强行放行、不得改服务端、
++  不得放宽任何容差。另：本次降级复测中同族三表曾出现瞬时
++  `export exceeded the server time budget`（复测 12/12 成功），属负载抖动，
++  按 §4.4 残余风险承接，不作为改白名单的理由；
++
++### 4.5 禁止改动范围
++- 禁止顺带改引擎/撮合/策略/校验器任何行为；禁止「优化」其他无关通道；禁止放宽容差；
++- 禁止与其他会话在途改动（`mcp_adapter.py` +33、`writers.py` 等）混入同一提交。
++
++---
++
++## 5. 验收标准
++
++1. **单元测试**（新增 `tests/test_mcp_passthrough_export_fallback.py`）：
++   - 3.1：`export_dataset` 收到 `time_start/time_end/async_mode` 正确断言（窗口仅当表在
++     `passthrough_export_window_tables` 名单内）；**非名单表 + `MCPExportBudgetError` →
++     不消费 `suggested_shards`、不二分，直接上抛（R-1 用例）**；`MCPExportBudgetError` → 有效
++     `suggested_shards` 消费 / 无效（重叠）时回落二分（M8：构造**重叠** suggested_shards →
++     断言聚合无重复行）；深度上限；半开区间断言；**聚合断言失败 ⇒ 全列去重一次，仍不等 ⇒
++     上抛且不写库（M-6 用例）**；0 行守卫仅在「实际携带窗口」时触发回落（m-2 用例）；
++     客户端裁剪与 `_fetch_passthrough` 同口径；
++   - 3.2：真实异常链构造（M1）——首页超时 → 降级触发；`MCPAuthError/MCPProtocolError`
++     不降级；非超时 `MCPTransportError` → 不降级且总尝试次数==5（重连自愈保留）；
++     兜底：非超时异常不降级按既有语义上抛（m-3）；首页成功 → 调用序列与修复前逐行一致（回归）；
++     **`max_attempts=1` 路径总 sleep == 0（M-2）**；`retry_max==1` 时重发分支
++     `max(1, retry_max-1)` 边界用例（m-4）；
++   - **B1 用例：开关 false + 首页超时 → 调用序列与修复前完全一致（5 次尝试，不降级）**；
++   - 3.3：`configure_execution` 后 client `call_timeout` 同步断言；`<=0` 回退 90；断言
++     `retry_max/backoff_sec/rate_per_min` **不被同步**（M3/M4 锁定）；
++   - S3：断言 `fetch_page` 实际发出的服务端 payload **不含** `max_attempts`（kw-only 不透传）；
++   - M7：断言 `:652/:2137/:2158/:2179` 四个调用点调用序列不变。
++2. **既有回归全绿**：`tests/test_mcp_*.py`（10 个既有文件）+ 相关管线测试套件。
++3. **实机复验（口径定稿，M-3）**：mcp_only profile 单跑 F-1、F-2 → 非 failed；随后全量跑批，
++   对照 20261004 台账，三判据**同时**成立：
++   - `failed = 0`；
++   - `success ≥ 59`；
++   - `empty` 集合 ⊆（20261004 的 15 项 ∪ {`mcp_llm_text_events_enriched_pt`,
++     `mcp_ws_asfund_pt`}）；若两任务返回 **0 行**，必须额外给出「该表在服务端确为 0 行」
++     的证据（manifest total_rows 对账），否则判为验收不通过。
++4. **探针准入证据（M6③ 硬性前置）**：§3.0 探针证据落盘 `docs/evidence/`，
++   逐表「带窗口行数 == 不带窗口行数（同口径裁剪后）」；通过的列入白名单；
++   **未见探针证据的表一律不在名单（窗口下推保持关闭，M-7）**。
++5. **黄金对比（m-1 补充）**：6 张宽文本表修复前后行数/内容与 2026-10-04 跑批一致
++   （llm_text_events 129,977 行等）；非宽文本 passthrough 表行数与上次一致；
++   `batch_audit` 逐项比对；任何差异逐项归因，禁止以「差异很小」放行。
++   **`llm_text_events_enriched`（F-1）无 10-04 黄金基线**（上次失败 0 行）——其验收口径 =
++   单跑 success + 行数 > 0 + 与 manifest `total_rows` 对账一致。
++6. **耗时回归（观测指标，S6/M-2 修订）**：F-2 由 ~900s 降至 <300s；构成 = 首页探测
++   ~90s（单次调用上限，零 sleep）+ export 异步等待；取 3 次跑批中位数，
++   受服务端负载影响不作为硬性失败判据。
++
++---
++
++## 6. 回退条件（B1/M-4/M-5 修订：可执行且逐行等效）
++
++1. **配置回退（主）**：`sources_config.json` 置 `passthrough_export_fallback=false` +
++   `passthrough_export_window_tables=[]` + `export_async=false` →
++   - 3.2 完全不探测（B1：`max_attempts=None`，`_fetch_passthrough` 逐行等效修复前）；
++   - 3.1 窗口下推全关（白名单空）；export 回到同步无窗口；
++   - **§3.1.3/§3.1.5 已随白名单置空完全失效，回退覆盖完整**（步骤 3 实测收口）：
++     白名单 `passthrough_export_window_tables=[]` ⇒ 无表携带窗口 ⇒ 无父窗 ⇒
++     §3.1.3 分片收缩（suggested_shards 消费/二分）与 §3.1.5 0 行守卫在任何表上
++     都不会被触发，配置回退对这两条的覆盖是**完整的**（非「可能成功」残余）。
++     §4.5 同批登记：二者为纯增益错误路径逻辑，无独立回退键（M-4 选 b）；
++2. **代码回退（辅）**：实施前先 `git stash create -u -m "baseline-<ts>"` 并 **`git stash store`
++   持久化**回退点（零副作用，不动工作区）；实施时把本方案自身 diff 另存 patch 文件；
++   回退 = **文件级定向 reverse-apply 本方案 patch**（只动本方案 hunk）。
++   **禁用 `git revert` / `git checkout --`**——共享工作区含他人未提交改动（`mcp_adapter.py` +33
++   等），文件级盲回退会抹他人工作（M5）；
++3. **触发回退判据**：任一黄金对比行数不一致且无法归因 / 任一既有测试红 / 原 72 个成功任务
++   出现新失败 / F-1、F-2 复验仍失败 / **任一大表「降级后行数 ≠ 未降级行数」且无法归因**——
++   任一命中即停止并回退，不得带病推进。
++
++---
++
++## 7. 文档同步范围（步骤 4-5 完成后执行）
++
++- `README.md`：MCP 数据采集相关章节（passthrough/export 采集行为段落）；
++- `docs/data-pipeline-contract.md`（当前已被其他会话改动，实施时协调叠加）；
++- `docs/strategy_toolbox.md` / `docs/prompt_engineering.md`：数据管线修复，经核实无涉及内容
++  则不更新（验收阶段核查确认）；
++- MCP 全数据源替代任务**实时进度报告**（`D:\miniQMT策略实盘\私募工作文件\QuantStudio-MCP全数据源替代任务文件\实时进度报告.md`）：
++  按铁律仅在 **复审通过后**更新，附证据（SHA/测试结果/跑批数据/探针证据）。
++
++---
++
++## 8. 六步流水线状态
++
++| 步骤 | 内容 | 状态 |
++|---|---|---|
++| 1 方案 | 本文档 v4（响应定点复核 R-1~R-7） | ✅ v4 修订完成 |
++| 2 审计 | 定点复核 ⚠️ 有条件通过（R-1 已补，无需再复审） | ✅ 审计收口 |
++| 3 实施 | 步骤 0 探针准入 → 按 v4 实施（写前快照+patch 留痕） | ⏸ 已解锁，待启动 |
++| 4 验收 | §5 全部通过，证据写入 `docs/evidence/*.md` | ⏸ |
++| 5 用户确认 | 完整汇报（改动+验收证据），经用户明确同意 | ⏸ |
++| 6 双仓库推送 | `git push origin` 双仓库 + HEAD 逐位核对 + QuantStudio-trading 同步门 | ⏸ |
++
++---
++
++## 9. 审计/复审修订对照表（v4 全量状态，标记与复核结论对齐）
++
++### 9.1 一审（M1–M9 / S1–S10）
++
++| 审计项 | v4 落点 | 状态 |
++|---|---|---|
++| M1 异常契约 | §3.2 异常契约段（复审确认准确） | ✅ |
++| M2 判据收敛 | §3.2 步骤 1 五出口 + 兜底（m-3/R-3） | ✅ |
++| M3 rate 剔除 | §3.3.1 + §4.3 第 1 行 + 单测锁定 | ✅ |
++| M4 backoff 剔除 | §3.3.1 + §4.3 第 2 行 + 单测锁定 | ✅ |
++| M5 回退可执行 | ⚠️ v2 部分闭环 → **v3 闭环**：§3.4 三键（fallback 总开关语义 B1 写死）+ §6 三步 + 判据补「降级行数不等」+ M-4 选 b 显式声明 | ✅（复审 B1/M-4 修正后） |
++| M6 窗口下推证据 | ⚠️ v2 部分闭环 → **v3 闭环**：§3.0 逐表探针 + §3.4 白名单 + §3.1.2 名单门控 + 0 行守卫（仅实际下推时生效）+ §5.4 前置 | ✅（复审 B2/M-5 修正后） |
++| M7 探测范围 | §3.2 仅 `:604` 传 1；4 调用点回归断言（§5.1） | ✅ |
++| M8 半开/去重 | ⚠️ v2 断言失败动作未定义 → **v3 定义**：全列去重一次，仍不等 ⇒ 上抛禁写库（M-6） | ✅ |
++| M9 call_timeout 落点 | §3.3.2 明确选② + §2 R3 同步改写 | ✅ |
++| S1 codes 守卫 | §3.2.3 | ✅ |
++| S2 meta 补齐 | §3.1.6 | ✅ |
++| S3 参数位置 | §3 改动表 + §5.1 payload 断言 | ✅ |
++| S4 探测边界 | §3.2 步骤 1（仅首页） | ✅ |
++| S5 口径钉死 | ⚠️ v2 内部冲突 → **v3 定稿**：三判据同立 + 0 行补服务端证据（M-3） | ✅ |
++| S6 耗时口径 | ✅ 口径（数值经 M-2 修订为 ~90s 探测零 sleep + export 异步） | ✅ |
++| S7 取值域 | §3.3.1 | ✅ |
++| S8 命名消歧 | §3.1 首行 | ✅ |
++| S9 残余风险 | §4.4 | ✅ |
++| S10 共用 client 影响 | §3.3.3 + §4.3 | ✅ |
++
++### 9.2 复审（B1/B2、M-1~M-7、m-1~m-7）
++
++| 复审项 | v4 落点 | 状态 |
++|---|---|---|
++| B1 开关 false 不探测 | §3.2 总开关语义段（写死 `max_attempts=None`）+ §3.4 表 + §6.1 + §5.1 B1 用例 | ✅ |
++| B2 白名单制 | §3.0（逐表探针）+ §3.1.2 + §3.2 步骤 2 + §3.4 `passthrough_export_window_tables` 默认 `[]` + §4.2 同步改写 | ✅ |
++| M-1 数字口径 | §4.2（62 张 fetch_page / 跑批 50；7 张宽文本 export）+ §3.2.5 + §4.3 表 | ✅ |
++| M-2 有效 attempts 上限 | §3 改动表（`:580`/`:589-595` 改有效上限）+ §3.2「零空转」段 + §4.3 确定性退避数值 + §5.1 sleep==0 用例 + §5.6 构成 | ✅ |
++| M-3 验收口径互斥 | §5.3 三判据同立 + 0 行补服务端证据 | ✅ |
++| M-4 3.1.3/3.1.5 无回退键 | §6.1 选 b：纯增益错误路径逻辑，修复前必失败，无等价性差异 | ✅ |
++| M-5 全局/逐表矛盾 | §3.0 逐表判据 + 名单即持久化（删除全局布尔键） | ✅ |
++| M-6 断言失败动作 | §3.1.3（全列去重一次 → 仍不等上抛禁写）+ §5.1 不写库用例 | ✅ |
++| M-7 默认 fail-safe | §3.4 白名单默认 `[]`（代码层默认不下推）+ §5.4 | ✅ |
++| m-1 enriched 无黄金基线 | §5.5 末段（success + 行数>0 + manifest total_rows 对账） | ✅ |
++| m-2 0 行守卫条件 | §3.1.5（仅实际携带窗口时生效）+ §5.1 用例 | ✅ |
++| m-3 兜底分支 | §3.2 步骤 1 兜底行 | ✅ |
++| m-4 retry_max==1 边界 | §3.2 步骤 1 `max(1, retry_max-1)` + §5.1 边界用例 | ✅ |
++| m-5 窗口记法 | §3.0（`[start_date, (跑批日+1天)T00:00:00)`，与 `:1213-1214` 同口径） | ✅ |
++| m-6 §9 标记对齐 | 本节（9.1/9.2 状态如实标注） | ✅ |
++| m-7 时间戳 | 文首 v4 定稿时间 02:53（实际定稿时间） | ✅ |
++| R-1 分片收缩绕过白名单 | §3.1.3（选 A：分片收缩=窗口下推，仅名单内可用；非名单直接上抛）+ §3.4 语义行 + 父窗定义 + §5.1 用例 | ✅ |
++| R-2 「三分支」措辞 | §3.2 总开关语义段 + §9.1 改「五出口」 | ✅ |
++| R-3 兜底举例分类 | §3.2 兜底行（改「未经 `_call_with_retry` 包装的异常」+ 注明 MCPToolError 落入重发分支） | ✅ |
++| R-4 裁剪/meta 影响点 | §4.2.1 补列 §3.1.4/§3.1.6 两项成功路径新行为 | ✅ |
++| R-5 重连次数量化 | §4.3 表（重连 4→3 次） | ✅ |
++| R-6 retry_max=1 限定 | §4.3 表（总尝试次数不变仅限 retry_max=5） | ✅ |
++| R-7 名单元素命名 | §3.4 表（名单元素 = canonical `table` 名） | ✅ |
++
++---
++
++## 10. 证据指针
++
++- 复盘：`output/mcp_only_collector_run_20261004_214251/failure_review.md`；
++- 一审：`docs/audit-mcp-passthrough-first-pull-export-fix-20261005.md`；
++- 复审：`docs/reaudit-mcp-passthrough-first-pull-export-fix-v2-20261005.md`；
++- 定点复核：`docs/recheck-mcp-passthrough-fix-v3-20261005.md`（⚠️ 有条件通过，R-1 已补）；
++- 代码锚点：`mcp_adapter.py:394/502-520/573-592/594-642/652/1209-1214/1228/2137/2158/2179`、
++  `client.py:173/265/528/533/548-597/580/589-595/767-778/800-853/1003-1042`、
++  `base.py:79-106`、`errors.py:26/74-91`、`daemon.py:984/988-991/2518`；
++- 配置：`config/profiles/mcp_only/sources_config.json`、`collector_tasks.json`
++  （88 任务 / 0 个 call_timeout / passthrough 69（启用 57）/ 宽文本 7 / codes 全 ALL /
++  calls_per_min 85×30+2×1+1×26）；
++- 基线：`docs/handoff/baseline-20261005-0209-mcp-passthrough-fix.txt`。
+
+diff --git a/tests/test_mcp_passthrough_export_fallback.py b/tests/test_mcp_passthrough_export_fallback.py
+new file mode 100644
+index 0000000..667c23f
+--- /dev/null
++++ b/tests/test_mcp_passthrough_export_fallback.py
+@@ -0,0 +1,600 @@
++# -*- coding: utf-8 -*-
++"""MCP passthrough 首轮拉取修复（F-1/F-2）的单元测试。
++
++方案：docs/mcp-passthrough-first-pull-export-fix-design.md（v4）§5.1
++探针证据：docs/evidence/mcp-passthrough-window-pushdown-probe-20261005-0403.md
++
++全部用例 monkeypatch，**不依赖网络 / 不连服务端 / 不写生产库**。
++覆盖：
++  §3.1  export 异步贯通 + 白名单窗口 + 预算错误消费（含 R-1 非名单表直接上抛、
++        重叠 suggested_shards 回落二分、聚合断言失败禁写库、0 行守卫触发条件）；
++  §3.2  fetch_page 首页探测五出口（超时降级 / Auth·Protocol 不降级 / 非超时重发 /
++        兜底未包装异常 / 首页成功后续页不变）+ B1 开关 false 逐行等效 + M-2 零 sleep；
++  §3.3  configure_execution 仅同步 call_timeout（M3/M4 锁定不同步其余三项）；
++  S3    max_attempts 不进入服务端 payload（kw-only）；
++  M7    四个无关调用点序列不变。
++"""
++import io
++import sys
++import threading
++from pathlib import Path
++
++import pandas as pd
++import pytest
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++
++from quantstudio.pipeline.mcp.client import MCPClient  # noqa: E402
++from quantstudio.pipeline.mcp.errors import (  # noqa: E402
++    MCPAuthError, MCPClientError, MCPExportBudgetError, MCPProtocolError,
++    MCPToolError, MCPTransportError,
++)
++from quantstudio.pipeline.mcp.models import Artifact, ExportManifest, Shard  # noqa: E402
++from quantstudio.pipeline.sources import mcp_adapter as ma  # noqa: E402
++
++
++# ---------------------------------------------------------------------------
++# 夹具
++# ---------------------------------------------------------------------------
++def _df(rows):
++    """rows: [(date, code)] → 含 date/ts_code 列的 DataFrame。"""
++    return pd.DataFrame({"date": [r[0] for r in rows],
++                         "ts_code": [r[1] for r in rows],
++                         "x": list(range(len(rows)))})
++
++
++def _bytes(df):
++    buf = io.BytesIO()
++    df.to_parquet(buf, index=False)
++    return buf.getvalue()
++
++
++def _artifact(df, aid="job/s0"):
++    return Artifact(artifact_id=aid, sha256="", size_bytes=1,
++                    parquet_bytes=_bytes(df), raw={"job_id": "job"})
++
++
++class _FakeClient:
++    """模拟 MCPClient：忠实复刻 _call_with_retry 的「有效尝试上限」语义。"""
++
++    def __init__(self):
++        self.retry_max = 5
++        self.call_timeout = 90.0
++        self.backoff_sec = (30, 60, 120, 240, 480)
++        self.rate_per_min = 200
++        self._lock = threading.Lock()
++        # 记录
++        self.fetch_page_calls = []      # dict(dataset_id, cursor, max_attempts)
++        self.attempts = 0               # 服务端实际尝试次数（模拟重试循环）
++        self.export_calls = []          # export_dataset kwargs
++        self.create_calls = []          # create_export_job kwargs
++        self.get_manifest_calls = []
++        # 行为注入
++        self.page_fn = None             # (cursor, attempt_no) -> payload | raise
++        self.export_fn = None           # (**kw) -> List[Artifact] | raise
++        self.subwindow_fn = None        # (ts, te) -> DataFrame（子窗数据）
++        self.reported_rows_fn = None    # (ts, te, df) -> int（manifest 申报行数）
++        self._job_seq = 0
++
++    # --- fetch_page ---
++    def fetch_page(self, dataset_id, cursor="", page_size=50000, columns=None,
++                   *, max_attempts=None):
++        eff = max_attempts if max_attempts else self.retry_max
++        self.fetch_page_calls.append({"dataset_id": dataset_id, "cursor": cursor,
++                                      "max_attempts": max_attempts, "eff": eff})
++        last = None
++        for i in range(eff):
++            self.attempts += 1
++            try:
++                if self.page_fn is None:
++                    return {"rows": [], "next_cursor": None}
++                return self.page_fn(cursor, i)
++            except (MCPAuthError, MCPProtocolError):
++                raise
++            except BaseException as e:  # noqa: BLE001
++                last = e
++        raise MCPTransportError(f"MCP 重试 {eff} 次仍失败: {last}") from last
++
++    # --- export ---
++    def export_dataset(self, dataset_id, page_size=50000, *, verify_each_shard=True,
++                       verify_concat=False, time_start=None, time_end=None,
++                       row_limit=None, async_mode=False, poll_timeout_sec=600.0):
++        kw = dict(dataset_id=dataset_id, page_size=page_size, time_start=time_start,
++                  time_end=time_end, row_limit=row_limit, async_mode=async_mode,
++                  poll_timeout_sec=poll_timeout_sec)
++        self.export_calls.append(kw)
++        if self.export_fn is None:
++            return []
++        return self.export_fn(**kw)
++
++    def create_export_job(self, dataset_id, page_size=50000, *, idempotency_key=None,
++                          time_start=None, time_end=None, row_limit=None,
++                          async_mode=False):
++        self.create_calls.append(dict(dataset_id=dataset_id, time_start=time_start,
++                                      time_end=time_end, async_mode=async_mode))
++        self._job_seq += 1
++        return f"job{self._job_seq}"
++
++    def get_manifest(self, job_id, *, await_ready=False, poll_interval_sec=2.0,
++                     poll_timeout_sec=600.0):
++        self.get_manifest_calls.append(job_id)
++        ts = self.create_calls[-1]["time_start"]
++        te = self.create_calls[-1]["time_end"]
++        df = self.subwindow_fn(ts, te) if self.subwindow_fn else pd.DataFrame()
++        rows = self.reported_rows_fn(ts, te, df) if self.reported_rows_fn else len(df)
++        return ExportManifest(job_id=job_id, dataset_id="d", table="t",
++                              total_rows=int(rows), shard_count=1,
++                              shards=[Shard(shard_id="s0", parquet_uri="u",
++                                            rows=int(rows))],
++                              raw={})
++
++    def get_artifact(self, job_id, artifact_id, *, verify_sha256=True):
++        ts = self.create_calls[-1]["time_start"]
++        te = self.create_calls[-1]["time_end"]
++        df = self.subwindow_fn(ts, te) if self.subwindow_fn else pd.DataFrame()
++        return _artifact(df, aid=f"{job_id}_{artifact_id}".replace("/", "_"))
++
++
++def _adapter(monkeypatch, tmp_path, cfg=None):
++    a = ma.MCPAdapter(dict(cfg or {"name": "mcp"}))
++    fake = _FakeClient()
++    a._client = fake
++    monkeypatch.setattr(a, "_landing_path",
++                        lambda job_id, shard_name: tmp_path / f"{job_id}_{shard_name}.parquet")
++    return a, fake
++
++
++def _client(monkeypatch):
++    """真实 MCPClient（无网络调用），供 _call_with_retry 语义用例使用。"""
++    c = MCPClient(endpoint="http://127.0.0.1:9/mcp", tls_verify=False,
++                  api_key="k", retry_budget_sec=0)
++    monkeypatch.setattr(c, "_acquire_rate", lambda: None)
++    monkeypatch.setattr(c, "_sleep_with_heartbeat", lambda *a, **k: None)
++    monkeypatch.setattr(c, "_reset_connection", lambda *a, **k: None)
++    return c
++
++
++# ===========================================================================
++# §5.1-A  client.py：_call_with_retry / fetch_page（M-2 零空转、S3 payload）
++# ===========================================================================
++def test_max_attempts_one_zero_sleep(monkeypatch):
++    """M-2：max_attempts=1 单次失败 ⇒ 不 sleep、不 reset，直接抛终态。"""
++    c = _client(monkeypatch)
++    sleeps, resets, calls = [], [], []
++
++    def boom(*a, **k):
++        calls.append(1)
++        raise TimeoutError("_call_tool 超过 89.5s 未返回")
++
++    monkeypatch.setattr(c, "_sleep_with_heartbeat", lambda *a, **k: sleeps.append(a[0]))
++    monkeypatch.setattr(c, "_reset_connection", lambda *a, **k: resets.append(1))
++    with pytest.raises(MCPTransportError) as ei:
++        c._call_with_retry(boom, max_attempts=1)
++    assert len(calls) == 1, f"应仅尝试 1 次: {len(calls)}"
++    assert sleeps == [], f"max_attempts=1 不得 sleep: {sleeps}"
++    assert resets == [], f"max_attempts=1 不得重置连接: {resets}"
++    assert isinstance(ei.value.__cause__, TimeoutError)
++
++
++def test_max_attempts_none_equivalent_to_retry_max(monkeypatch):
++    """max_attempts=None ⇒ 与改动前逐行等效（5 次尝试、4 次退避）。"""
++    c = _client(monkeypatch)
++    sleeps, calls = [], []
++
++    def boom(*a, **k):
++        calls.append(1)
++        raise MCPToolError("tool error")
++
++    monkeypatch.setattr(c, "_sleep_with_heartbeat", lambda *a, **k: sleeps.append(a[0]))
++    with pytest.raises(MCPTransportError) as ei:
++        c._call_with_retry(boom)
++    assert len(calls) == 5, f"默认应 5 次尝试: {len(calls)}"
++    assert sleeps == [30, 60, 120, 240], f"退避序列被改变: {sleeps}"
++    assert "MCP 重试 5 次仍失败" in str(ei.value)
++
++
++def test_retry_max_one_boundary_still_one_attempt(monkeypatch):
++    """retry_max=1 且未传 max_attempts ⇒ 1 次尝试、0 次退避。"""
++    c = _client(monkeypatch)
++    c.retry_max = 1
++    sleeps, calls = [], []
++    monkeypatch.setattr(c, "_sleep_with_heartbeat", lambda *a, **k: sleeps.append(a[0]))
++    with pytest.raises(MCPTransportError):
++        c._call_with_retry(lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(
++            MCPToolError("x")))
++    assert len(calls) == 1 and sleeps == []
++
++
++def test_fetch_page_payload_has_no_max_attempts(monkeypatch):
++    """S3：max_attempts 为 kw-only，绝不进入服务端 payload。"""
++    c = _client(monkeypatch)
++    seen = {}
++    monkeypatch.setattr(c, "_call_tool",
++                        lambda tool, args: seen.update(tool=tool, args=args)
++                        or {"rows": [], "next_cursor": None})
++    c.fetch_page(dataset_id="t", max_attempts=1)
++    assert seen["tool"] == "fetch_page"
++    assert "max_attempts" not in seen["args"], f"payload 泄漏 max_attempts: {seen['args']}"
++    # kw-only：位置传参必须 TypeError
++    with pytest.raises(TypeError):
++        c.fetch_page("t", "", 50000, None, 1)
++
++
++def test_fetch_page_forwards_max_attempts_to_retry(monkeypatch):
++    """fetch_page 透传 max_attempts 给 _call_with_retry（默认 None）。"""
++    c = _client(monkeypatch)
++    got = []
++    orig = c._call_with_retry
++    monkeypatch.setattr(c, "_call_with_retry",
++                        lambda fn, *a, **k: got.append(k.get("max_attempts")) or orig(fn, *a, **k))
++    monkeypatch.setattr(c, "_call_tool",
++                        lambda tool, args: {"rows": [], "next_cursor": None})
++    c.fetch_page(dataset_id="t")
++    c.fetch_page(dataset_id="t", max_attempts=1)
++    assert got == [None, 1], f"透传序列异常: {got}"
++
++
++# ===========================================================================
++# §5.1-B  _fetch_export_passthrough（白名单窗口 / 预算错误 / 聚合 / 0 行守卫）
++# ===========================================================================
++def test_window_pushed_only_for_whitelisted_table(monkeypatch, tmp_path):
++    """名单内表：下推半开区间 + async；名单外表：不下推（async 仍贯通）。"""
++    uni = _df([("2026-01-01", "A"), ("2026-02-01", "B")])
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "export_async": True,
++        "passthrough_export_window_tables": ["llm_text_events"]})
++    fake.export_fn = lambda **kw: [_artifact(uni)]
++
++    df, meta = a._fetch_export_passthrough("llm_text_events", "daily",
++                                           "2026-01-01", "2026-10-05")
++    kw = fake.export_calls[-1]
++    assert kw["time_start"] == "2026-01-01T00:00:00"
++    assert kw["time_end"] == "2026-10-06T00:00:00"     # 半开：end+1day
++    assert kw["async_mode"] is True
++    assert meta["window"] is True and meta["async"] is True
++
++    # 名单外（rsshub_raw 不在名单）
++    df2, meta2 = a._fetch_export_passthrough("rsshub_raw", "daily",
++                                             "2026-01-01", "2026-10-05")
++    kw2 = fake.export_calls[-1]
++    assert kw2["time_start"] is None and kw2["time_end"] is None
++    assert kw2["async_mode"] is True                    # async 不受白名单约束
++    assert meta2["window"] is False
++
++
++def test_async_default_false_when_not_configured(monkeypatch, tmp_path):
++    """export_async 未配置 ⇒ async_mode=False（默认关，旧行为）。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {"name": "mcp"})
++    fake.export_fn = lambda **kw: [_artifact(_df([("2026-01-01", "A")]))]
++    a._fetch_export_passthrough("rsshub_raw", "daily", "2026-01-01", "2026-10-05")
++    assert fake.export_calls[-1]["async_mode"] is False
++
++
++def test_non_whitelisted_budget_error_propagates_without_sharding(monkeypatch, tmp_path):
++    """R-1：非名单表（无父窗）撞预算错误 ⇒ 不消费 suggested_shards、不二分，直接上抛。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "export_async": True})          # 白名单为空
++
++    def boom(**kw):
++        raise MCPExportBudgetError(
++            "budget", error_code="export_exceeds_time_budget",
++            hint="shard it",
++            suggested_shards=[{"time_start": "2020-01-01", "time_end": "2023-01-01"},
++                              {"time_start": "2023-01-01", "time_end": "2026-10-06"}])
++    fake.export_fn = boom
++    with pytest.raises(MCPExportBudgetError):
++        a._fetch_export_passthrough("llm_text_events_enriched", "daily",
++                                    "2020-01-01", "2026-10-05")
++    assert len(fake.export_calls) == 1, "不得二次尝试"
++    assert fake.create_calls == [], "不得消费 suggested_shards / 不得二分"
++
++
++def test_overlapping_suggested_shards_falls_back_to_bisect_no_duplicates(
++        monkeypatch, tmp_path):
++    """重叠 suggested_shards（不两两大概率不交）⇒ 回落父窗二分 ⇒ 结果无重复行。"""
++    uni = _df([("2024-02-01", "A"), ("2024-05-01", "B"), ("2025-01-01", "C"),
++               ("2025-07-01", "D"), ("2026-01-01", "E"), ("2026-09-01", "F")])
++
++    def _sub(ts, te):
++        d = ts[:10].replace("-", "")
++        e = te[:10].replace("-", "")
++        key = uni["date"].astype(str).str.replace("-", "", regex=False)
++        return uni[(key >= d) & (key < e)].reset_index(drop=True)
++
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "export_async": True,
++        "passthrough_export_window_tables": ["cnthesims_events"]})
++    calls = {"n": 0}
++
++    def boom(**kw):
++        calls["n"] += 1
++        raise MCPExportBudgetError(
++            "budget", error_code="export_exceeds_time_budget",
++            # 故意重叠：第二段起点早于第一段终点
++            suggested_shards=[{"time_start": "2024-01-01", "time_end": "2025-06-01"},
++                              {"time_start": "2025-01-01", "time_end": "2026-10-06"}])
++    fake.export_fn = boom
++    fake.subwindow_fn = _sub
++
++    df, meta = a._fetch_export_passthrough("cnthesims_events", "daily",
++                                           "2024-01-01", "2026-10-05")
++    assert calls["n"] == 1, "父窗仅应失败一次"
++    assert meta["subjobs"] >= 2 and meta["subjobs"] <= 16, f"子作业越界: {meta['subjobs']}"
++    # 重叠建议窗未被采用
++    used = {(c["time_start"], c["time_end"]) for c in fake.create_calls}
++    assert ("2024-01-01T00:00:00", "2025-06-01T00:00:00") not in used
++    assert ("2025-01-01T00:00:00", "2026-10-06T00:00:00") not in used
++    # 二分窗两两不交
++    srt = sorted(used)
++    for i in range(1, len(srt)):
++        assert srt[i][0] >= srt[i - 1][1], f"子窗重叠: {srt[i - 1]} / {srt[i]}"
++    # 无重复行，且覆盖全量
++    assert len(df) == len(uni), f"行数不符: {len(df)} vs {len(uni)}"
++    assert not df.duplicated().any(), "存在重复行"
++    assert sorted(df["ts_code"]) == sorted(uni["ts_code"])
++
++
++def test_aggregation_mismatch_raises_and_never_writes_db(monkeypatch, tmp_path):
++    """M-6：聚合断言失败（全列去重后仍不等）⇒ 上抛且不写库。"""
++    uni = _df([("2025-01-01", "A"), ("2026-01-01", "B")])
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "export_async": True,
++        "passthrough_export_window_tables": ["cnthesims_events"]})
++    fake.export_fn = lambda **kw: (_ for _ in ()).throw(
++        MCPExportBudgetError("budget", error_code="export_exceeds_time_budget"))
++    def _sub(ts, te):
++        d = ts[:10].replace("-", "")
++        e = te[:10].replace("-", "")
++        key = uni["date"].astype(str).str.replace("-", "", regex=False)
++        return uni[(key >= d) & (key < e)].reset_index(drop=True)
++    fake.subwindow_fn = _sub
++    # 申报行数恒比实际多 1 ⇒ 去重也无法对齐
++    fake.reported_rows_fn = lambda ts, te, df: len(df) + 1
++
++    writes = []
++    monkeypatch.setattr(ma, "locked_connect", lambda *a, **k: writes.append(1))
++    with pytest.raises(MCPClientError):
++        a._fetch_export_passthrough("cnthesims_events", "daily",
++                                    "2024-01-01", "2026-10-05")
++    assert writes == [], "聚合断言失败期间不得打开任何写库连接"
++
++
++def test_zero_row_guard_only_when_window_actually_pushed(monkeypatch, tmp_path):
++    """m-2：0 行守卫仅在本次实际携带窗口时触发单次回落。"""
++    # 名单内 + 窗口 ⇒ 回落一次（第二次不带窗）
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "export_async": True,
++        "passthrough_export_window_tables": ["rsshub_raw"]})
++    seq = {"n": 0}
++
++    def empty_then_rows(**kw):
++        seq["n"] += 1
++        return [] if seq["n"] == 1 else [_artifact(_df([("2026-03-01", "A")]))]
++    fake.export_fn = empty_then_rows
++    df, meta = a._fetch_export_passthrough("rsshub_raw", "daily",
++                                           "2026-01-01", "2026-10-05")
++    assert len(fake.export_calls) == 2, "应单次回落"
++    assert fake.export_calls[1]["time_start"] is None
++    assert fake.export_calls[1]["time_end"] is None
++    assert len(df) == 1
++
++    # 名单外（未下推）⇒ 0 行是合法空表，不回落
++    a2, fake2 = _adapter(monkeypatch, tmp_path, {"name": "mcp", "export_async": True})
++    fake2.export_fn = lambda **kw: []
++    df2, meta2 = a2._fetch_export_passthrough("rsshub_raw", "daily",
++                                              "2026-01-01", "2026-10-05")
++    assert len(fake2.export_calls) == 1, "未下推时不得回落"
++    assert len(df2) == 0 and meta2["window"] is False
++
++
++def test_export_clipping_same_caliber_as_fetch_passthrough(monkeypatch, tmp_path):
++    """§3.1.4：export 路径客户端裁剪与 _fetch_passthrough 同口径。"""
++    uni = _df([("2025-12-31", "OLD"), ("2026-01-01", "IN1"),
++               ("2026-06-30", "IN2"), ("2026-07-01", "NEW")])
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "export_async": True,
++        "passthrough_export_window_tables": ["rsshub_raw"]})
++    fake.export_fn = lambda **kw: [_artifact(uni)]
++    df_e, _ = a._fetch_export_passthrough("rsshub_raw", "daily",
++                                          "2026-01-01", "2026-06-30")
++
++    # fetch_page 通道：同口径裁剪
++    a2, fake2 = _adapter(monkeypatch, tmp_path, {"name": "mcp"})
++    fake2.page_fn = lambda cursor, i: (
++        {"rows": uni.to_dict("records"), "next_cursor": None})
++    df_p, _ = a2._fetch_passthrough("rsshub_raw", "daily",
++                                    "2026-01-01", "2026-06-30", None)
++    assert sorted(df_e["ts_code"]) == sorted(df_p["ts_code"]) == ["IN1", "IN2"]
++
++
++# ===========================================================================
++# §5.1-C  _fetch_passthrough 五出口 + B1 + M7
++# ===========================================================================
++def _timeout_page_fn(*a, **k):
++    raise TimeoutError("_call_tool 超过 89.5s 未返回")
++
++
++def test_timeout_first_page_triggers_export_fallback(monkeypatch, tmp_path):
++    """真实异常链（MCPTransportError from TimeoutError）⇒ 降级 export。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "passthrough_export_fallback": True, "export_async": True})
++    fake.page_fn = _timeout_page_fn
++    fake.export_fn = lambda **kw: [_artifact(_df([("2026-01-01", "A")]))]
++    df, meta = a._fetch_passthrough("ws_asfund", "daily", "2026-01-01", "2026-10-05",
++                                    ["ALL"])
++    assert meta["fetch_mode"] == "export_fallback", f"未降级: {meta}"
++    assert len(df) == 1
++    assert len(fake.export_calls) == 1
++    assert fake.fetch_page_calls[0]["max_attempts"] == 1   # 仅首页探测
++
++
++def test_auth_and_protocol_errors_not_degraded(monkeypatch, tmp_path):
++    """MCPAuthError / MCPProtocolError ⇒ 原样上抛，不降级。"""
++    for exc in (MCPAuthError("401"), MCPProtocolError("bad protocol")):
++        a, fake = _adapter(monkeypatch, tmp_path, {
++            "name": "mcp", "passthrough_export_fallback": True})
++        fake.page_fn = lambda *a, **k: (_ for _ in ()).throw(exc)
++        with pytest.raises(type(exc)):
++            a._fetch_passthrough("ws_asfund", "daily", "2026-01-01", "2026-10-05", None)
++        assert fake.export_calls == [], f"{type(exc).__name__} 不应降级"
++
++
++def test_non_timeout_transport_error_resends_five_attempts(monkeypatch, tmp_path):
++    """非超时 MCPTransportError ⇒ 不降级，重发后总尝试 == 5（retry_max=5）。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "passthrough_export_fallback": True})
++    fake.page_fn = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ECONNRESET 10053"))
++    with pytest.raises(MCPTransportError):
++        a._fetch_passthrough("ws_asfund", "daily", "2026-01-01", "2026-10-05", None)
++    assert fake.attempts == 5, f"总尝试应为 1+(5-1)=5: {fake.attempts}"
++    assert fake.export_calls == [], "非超时错误不得降级"
++    assert [c["max_attempts"] for c in fake.fetch_page_calls] == [1, 4], \
++        f"重发上限应为 max(1, retry_max-1)=4: {fake.fetch_page_calls}"
++
++
++def test_retry_max_one_boundary_resend(monkeypatch, tmp_path):
++    """m-4：retry_max==1 ⇒ 重发上限夹取为 1（总尝试 2，不出现 0 次尝试）。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "passthrough_export_fallback": True})
++    fake.retry_max = 1
++    fake.page_fn = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("reset"))
++    with pytest.raises(MCPTransportError):
++        a._fetch_passthrough("ws_asfund", "daily", "2026-01-01", "2026-10-05", None)
++    assert [c["max_attempts"] for c in fake.fetch_page_calls] == [1, 1]
++    assert fake.attempts == 2
++
++
++def test_switch_off_is_line_equivalent_to_before(monkeypatch, tmp_path):
++    """B1：开关 false + 首页超时 ⇒ 完全不探测，5 次尝试，不降级。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {"name": "mcp"})  # 默认 false
++    assert a.passthrough_export_fallback is False
++    fake.page_fn = _timeout_page_fn
++    with pytest.raises(MCPTransportError):
++        a._fetch_passthrough("ws_asfund", "daily", "2026-01-01", "2026-10-05", None)
++    assert fake.attempts == 5, f"修复前语义为 5 次尝试: {fake.attempts}"
++    assert all(c["max_attempts"] is None for c in fake.fetch_page_calls)
++    assert fake.export_calls == [], "开关 false 不得降级"
++
++
++def test_unwrapped_exception_not_degraded(monkeypatch, tmp_path):
++    """m-3：未经 _call_with_retry 包装的异常（cursor 不前进 ValueError）不降级。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "passthrough_export_fallback": True})
++    fake.page_fn = lambda cursor, i: ({"rows": [{"a": 1}], "next_cursor": "SAME"}
++                                      if i == 0 else {"rows": [], "next_cursor": None})
++    with pytest.raises(ValueError):
++        a._fetch_passthrough("ws_asfund", "daily", "2026-01-01", "2026-10-05", None)
++    assert fake.export_calls == [], "未包装异常不得降级"
++
++
++def test_first_page_success_keeps_old_behaviour(monkeypatch, tmp_path):
++    """S4：首页成功 ⇒ 后续页 max_attempts=None（与修复前逐行一致）。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "passthrough_export_fallback": True})
++    pages = [{"rows": [{"date": "2026-01-01"}], "next_cursor": "c1"},
++             {"rows": [{"date": "2026-01-02"}], "next_cursor": None}]
++    fake.page_fn = lambda cursor, i: pages[0] if cursor in ("", None) else pages[1]
++    df, meta = a._fetch_passthrough("ws_asfund", "daily", "2026-01-01", "2026-10-05", None)
++    assert meta["fetch_mode"] == "fetch_page"
++    assert len(df) == 2
++    assert [c["max_attempts"] for c in fake.fetch_page_calls] == [1, None], \
++        f"后续页必须为 None: {fake.fetch_page_calls}"
++    assert fake.export_calls == []
++
++
++def test_four_other_call_sites_unchanged(monkeypatch, tmp_path):
++    """M7：:652/:2137/:2158/:2179 四个调用点不传 max_attempts。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {
++        "name": "mcp", "passthrough_export_fallback": True})
++    fake.page_fn = lambda cursor, i: {"rows": [{"ts_code": "600000.SH"}],
++                                      "next_cursor": None}
++    a._fetch_small_table("stock_basic", "daily", "2026-01-01", "2026-10-05", None)
++    a.get_all_stock_codes()
++    a.get_etf_codes()
++    a.get_index_codes()
++    assert fake.fetch_page_calls, "四个调用点应各发起分页"
++    assert all(c["max_attempts"] is None for c in fake.fetch_page_calls), \
++        f"无关调用点被外溢: {fake.fetch_page_calls}"
++
++
++# ===========================================================================
++# §5.1-D  configure_execution：仅同步 call_timeout（M3/M4/S7）
++# ===========================================================================
++def test_configure_execution_syncs_only_call_timeout_no_client(monkeypatch, tmp_path):
++    """client 未建 ⇒ 记桥接值，构造时传入；<=0 回退 90。"""
++    a, _ = _adapter(monkeypatch, tmp_path, {"name": "mcp"})
++    a._client = None
++    a.configure_execution({"call_timeout": 30})
++    assert a._client_call_timeout == 30.0
++
++    a.configure_execution({"call_timeout": 0})
++    assert a._client_call_timeout == 90.0, "<=0 必须回退 90（禁止 join(0)）"
++    a.configure_execution({"call_timeout": -5})
++    assert a._client_call_timeout == 90.0
++
++    captured = {}
++
++    class _FakeMCPClient:
++        def __init__(self, **kw):
++            captured.update(kw)
++            self.call_timeout = kw.get("call_timeout", 90.0)
++            self._lock = threading.Lock()
++
++        def handshake_bounded(self, *a, **k):
++            return None
++
++    monkeypatch.setattr(ma, "MCPClient", _FakeMCPClient)
++    monkeypatch.setattr(ma, "load_mcp_api_key", lambda *a, **k: "k")
++    a.configure_execution({"call_timeout": 25})
++    _ = a.client
++    assert captured.get("call_timeout") == 25.0
++    # M3/M4：绝不同步其余三项
++    for k in ("retry_max", "retry_backoff_sec", "backoff_sec", "rate_per_min"):
++        assert k not in captured, f"{k} 被同步（M3/M4 禁止）"
++
++
++def test_configure_execution_updates_existing_client_under_lock(monkeypatch, tmp_path):
++    """client 已建 ⇒ 在 _lock 内更新 call_timeout，其余字段零改动。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {"name": "mcp"})
++    a.configure_execution({"call_timeout": 45})
++    assert fake.call_timeout == 45.0
++    assert fake.retry_max == 5
++    assert fake.backoff_sec == (30, 60, 120, 240, 480)
++    assert fake.rate_per_min == 200
++
++
++def test_configure_execution_keeps_base_semantics(monkeypatch, tmp_path):
++    """基类语义保留：retry/backoff 仍按任务配置写入 adapter（不影响 client）。"""
++    a, fake = _adapter(monkeypatch, tmp_path, {"name": "mcp"})
++    a.configure_execution({"retry": {"max": 3, "backoff_sec": [1, 2, 3]},
++                           "call_timeout": 12})
++    assert a.retry_max == 3 and tuple(a.retry_backoff_sec) == (1, 2, 3)
++    assert fake.retry_max == 5 and fake.backoff_sec == (30, 60, 120, 240, 480)
++
++
++def test_default_whitelist_and_switch():
++    """默认：白名单空（fail-safe 不下推）+ 降级开关 false。"""
++    a = ma.MCPAdapter({"name": "mcp"})
++    assert a.passthrough_export_window_tables == frozenset()
++    assert a.passthrough_export_fallback is False
++    assert ma.MCPAdapter._is_timeout_family(MCPTransportError("x")) is False
++
++
++def test_is_timeout_family_uses_cause_chain():
++    """异常链 ≤3 层内出现 TimeoutError 即判为超时族。"""
++    try:
++        try:
++            raise TimeoutError("deep")
++        except TimeoutError as te:
++            raise MCPToolError("wrapped") from te
++    except MCPToolError as mte:
++        # 模拟 client 终态：MCPTransportError(…) from <上层异常>
++        exc = MCPTransportError("MCP 重试 1 次仍失败")
++        exc.__cause__ = mte
++        exc.__context__ = mte
++    assert ma.MCPAdapter._is_timeout_family(exc) is True
++
++
++if __name__ == "__main__":
++    sys.exit(pytest.main([__file__, "-q"]))
+
+diff --git a/docs/evidence/mcp-passthrough-window-pushdown-probe-20261005-0403.md b/docs/evidence/mcp-passthrough-window-pushdown-probe-20261005-0403.md
+new file mode 100644
+index 0000000..0cc2218
+--- /dev/null
++++ b/docs/evidence/mcp-passthrough-window-pushdown-probe-20261005-0403.md
+@@ -0,0 +1,92 @@
++# 步骤 0 准入探针证据：passthrough export 窗口下推（2026-10-05 03:24–03:58）
++
++- 方案：`docs/mcp-passthrough-first-pull-export-fix-design.md`（v4）§3.0
++- 性质：**只读**探针。临时脚本置于 `d:/tmp/`（不落库、不进 git、不在工作区），
++  复用 `MCPAdapter.client.export_dataset`，未调用任何写库/写文件（parquet 仅在内存 BytesIO 读取）。
++- 环境：`C:\Users\hasym\.conda\envs\quant310\python.exe`（duckdb 1.5.6 / pandas 2.3.3）；
++  endpoint = `https://quantstudio.online/mcp`（profile 现网值）；`export_async=true`。
++- 跑批日取当日 2026-10-05 ⇒ 窗口上界 = `2026-10-06T00:00:00`（与 `mcp_adapter.py:1213-1214` 同口径半开）。
++- 窗口下界取各表任务 `start_date`（`config/profiles/mcp_only/collector_tasks.json`）。
++- 比对口径：两路结果均经 `_fetch_passthrough` 同口径客户端裁剪（`date/trade_date/cal_date`）后比行数。
++
++## 1. 逐表结果（8 张：7 张宽文本 + ws_asfund）
++
++| # | 表（canonical=qdb） | 任务 start_date | 无窗（裁剪后） | 带窗（裁剪后） | 判定 |
++|---|---|---|---|---|---|
++| 1 | `cnthesims_events` | 2024-01-01 | 104,826 | 104,826 | ✅ 相等 |
++| 2 | `ai_research_snapshot` | 2020-01-01 | 11,758 | 11,758 | ✅ 相等 |
++| 3 | `llm_text_events` | 2020-01-01 | 首轮 ERROR（见 §3）/ 复测 129,977 | 104,425 | ❌ 不等 |
++| 4 | `llm_text_events_enriched` | 2020-01-01 | 首轮 ERROR / 复测 129,977 | 104,425 | ❌ 不等 |
++| 5 | `llm_text_raw_feed` | 2020-01-01 | 首轮 ERROR / 复测 129,977 | 104,425 | ❌ 不等 |
++| 6 | `rsshub_raw` | 2020-01-01 | 18,560 | 18,560 | ✅ 相等 |
++| 7 | `tdx_theme_news` | 2020-01-01 | 17,294 | 17,294 | ✅ 相等 |
++| 8 | `ws_asfund` | 2024-01-01 | 42,974 | 42,974 | ✅ 相等 |
++
++原始 JSON（含 shard 数）留存于探针运行输出：
++`d:/tmp/qs_probe_window_result.txt`（会话内临时产物，非仓库文件）。
++
++## 2. 三张 `llm_text_*` 不等的**精确归因**（决定性证据）
++
++生产库 `data/quantstudio.db` 只读对账（duckdb read_only）：
++
++| 表 | 库内行数 | `publish_time` min | 早于任务 start_date 的行数 |
++|---|---|---|---|
++| `llm_text_events` | 129,977 | 2018-01-02 | **25,552** |
++| `llm_text_raw_feed` | 129,977 | 2018-01-02 | **25,552** |
++
++- 差值 129,977 − 104,425 = **25,552** ⇒ 与「`publish_time < 2020-01-01` 的行数」**逐位吻合**。
++- 结论：`llm_text_*` 三表窗口下推会**静默丢弃 25,552 行（占 19.7%）**。passthrough 是全量覆盖语义，
++  下推即等于把库内历史行删除 ⇒ **三表绝不进白名单**（判据：不等 → 不列入，永不窗口下推）。
++- 旁证（同口径窗口足够宽时即相等）：以 `time_start=2018-01-01T00:00:00` 复测三表，
++  带窗 = 129,977 = 无窗（见 §3），证明差异**纯粹**来自 start_date 早于数据真实下界，
++  而非服务端过滤语义错配。
++
++## 3. 复测对照：async_mode × 窗口（`llm_text_*` 三表，2026-10-05 03:53）
++
++| 表 | 无窗 sync | 无窗 async | 窗[2018,b+1) async | 窗[2018,b+1) sync |
++|---|---|---|---|---|
++| `llm_text_events` | 129,977 ✅ 29.3s | 129,977 ✅ 28.2s | 129,977 ✅ 23.9s | 129,977 ✅ 26.3s |
++| `llm_text_events_enriched` | 129,977 ✅ 46.4s | 129,977 ✅ 37.5s | 129,977 ✅ 159.8s | 129,977 ✅ 39.6s |
++| `llm_text_raw_feed` | 129,977 ✅ 92.9s | 129,977 ✅ 67.3s | 129,977 ✅ 95.5s | 129,977 ✅ 90.3s |
++
++两点结论（**推翻/修正方案的两处隐含假设**）：
++
++1. **首轮 3 次 `MCPProtocolError: export exceeded the server time budget (60.0s)` 是瞬时负载现象，
++   非确定性失败**：复测同三表 12 次调用全部成功（最长 159.8s）。
++   即 F-1 的 60s 软预算失败是**负载相关、边界抖动**，不是该数据集恒定不可导出。
++2. **`async_mode` 不是 F-1 的解、也不是其风险源**：同步/异步在本组对照中行数与成功与否完全一致，
++   仅耗时有差异（46.4s vs 37.5s）。§3.1.1 异步贯通属纯机制增益，对成功路径行数无影响。
++
++## 4. 白名单结论
++
++- **可进名单（证据=相等）**：`cnthesims_events`、`ai_research_snapshot`、`rsshub_raw`、
++  `tdx_theme_news`、`ws_asfund`（且经库内对账确认「早于 start_date 的行数 = 0」，见 §5）。
++- **禁止进名单**：`llm_text_events`、`llm_text_events_enriched`、`llm_text_raw_feed`
++  （§2 决定性归因：下推丢 25,552 行）。
++- **本轮实际采用名单 = `[]`（空）**，理由：
++  1. 硬约束【E】与 fail-safe 默认「未列名单一律不下推」一致；
++  2. 唯一**需要**靠窗口收缩救命的表（`llm_text_events_enriched`）恰恰被证据**禁止**下推
++     ⇒ 名单非空对本轮两个失败任务（F-1/F-2）无收益，只会给 5 张当前成功的表引入新的成功路径行为变更；
++  3. 上述 5 张候选如需上名单，须先经 §5.5 黄金对比（行数/内容逐项一致）单独立项。
++  ⇒ 代码默认与 profile 均保持空名单，窗口下推**全局关闭**，仅 async 贯通生效。
++
++## 5. 5 张候选「零行外丢失」库内佐证（只读）
++
++| 表 | 库内行数 | 时间列 | min | max | 早于 start_date |
++|---|---|---|---|---|---|
++| `cnthesims_events` | 104,826 | `event_time` | 2025-07-14 | 2026-09-24 | 0 |
++| `ai_research_snapshot` | 11,758 | `scan_date` | 2026-06-12 | 2026-10-02 | 0 |
++| `rsshub_raw` | 18,050 | `pub_time` | 2026-03-19 | 2026-10-02 | 0 |
++| `tdx_theme_news` | 17,271 | `ts` | 2022-01-12 | 2026-10-02 | 0 |
++| `ws_asfund` | 库内缺失（F-2 上次失败，无历史） | `trade_date` | — | — | — |
++
++## 6. 对方案的修正登记（步骤 3 实测发现，供步骤 4/5 复核）
++
++- **R-8（新增）**：§3.0 准入判据在 `start_date` 早于数据真实下界时会给出「不等 → 不列入」，
++  这是**保护**而非缺陷；但方案 §3.1.2 隐含「宽文本表靠下推解预算」的假设在本轮数据分布下**不成立**
++  （唯一需要下推的表被禁止下推）。F-1 的兜底因此退化为「async 贯通 + 负载窗口」，
++  残余失败概率由 §4.4 声明承接。
++- **R-9（新增）**：§3.0 判据中「无日期列 → 不列入」按 `_fetch_passthrough` 裁剪口径
++  （`date/trade_date/cal_date`）严格解释时，7 张宽文本表中 4 张（含 `tdx_theme_news`）无该三元列；
++  本证据按「存在可用时间列 + 实测行数相等 + 库内零行外丢失」三重条件记录候选，
++  但最终采用空名单，该歧义**不产生行为差异**（下推全局关闭）。

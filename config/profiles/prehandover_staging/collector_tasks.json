@@ -2721,7 +2721,7 @@
     "rebuild_on_gap": true
   },
   "qfq_orchestrator": {
-    "enabled": true,
+    "enabled": false,
     "require_bootstrap": true,
     "price_source": "mcp",
     "stock_factor_detector": "mcp_factor_detector",

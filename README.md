@@ -92,6 +92,8 @@ python -m quantstudio.pipeline.daemon --mode forever
 
 GUI 中的“全量拉取”“增量拉取”“进程常驻增量拉取”调用相同公共入口。
 
+**写入停摆防护（2026-10-02，框架层）**：写路径（`writers.py` 各 `conn.execute`）历史上**没有任何有界等待**——一旦某条写入语句进入不可返回状态，就会表现为“永久静默挂起 + 持写锁 + 单核空转 + 零日志”并阻塞全部采集（2026-10-02 两次 `mcp_stock_daily` 事故，均卡在累计 2,749,437 行后的第 57 批）。现已为所有读写语句加装**双段看门狗**：单条语句超预算（`QS_DUCKDB_WRITE_TIMEOUT_S`，默认 600s）即 `logger.critical` + `conn.interrupt()`（DuckDB 1.4.5 实测：抛 `InterruptException`、事务完整回滚、连接可复用，生效延迟约 12s）；若 interrupt 后 `QS_DUCKDB_WRITE_HARD_ABORT_S`（默认 300s）仍不返回，则落诊断 JSONL 后以 75(EX_TEMPFAIL) 退出，释放锁、避免空转。**生产请勿关闭第二段**（关闭后若语句不响应 interrupt，会退回无限空转）。每批日志附带 `count/dml/close` 分段耗时，慢批（`QS_DUCKDB_WRITE_SLOW_S`，默认 60s）额外告警。批间隙 `CHECKPOINT` 可选（`QS_DUCKDB_WRITE_CHECKPOINT_BATCHES`，默认关）。诊断落 `data/logs/duckdb_write_stall.jsonl`（flush+fsync）。设计见 `docs/duckdb-write-stall-mitigation-design.md`。
+
 指数日线（F5）：`index_daily` 任务的正式动态宇宙（`get_index_daily_universe`）统一覆盖普通指数与 31 个 SW2021 L1 申万行业指数，full/incremental/resident 同一路径——tushare 普通指数走 `index_daily` 接口、申万指数走 `sw_daily` 正式接口，同一 canonical schema（股/元）；`industry_classification` / `industry_membership` 任务维护正式 SW2021 行业分类与 PIT 成员历史（tushare `index_classify`/`index_member`），旧 `sw_industry` 仅为审计快照。契约详见 `docs/data-pipeline-contract.md`。
 
 ### MCP 数据源与 is_qfq 还原（线1）

@@ -1,0 +1,30 @@
+﻿V7 离线实测：主键重建（PK rebuild）在生产库副本上的锁表窗口与空间回收
+============================================================
+脚本：docs/evidence/hang2_v7_pk_rebuild_probe.py（副本上执行，不触碰生产库）
+
+[实测读数]
+before: rows=2764437 db=3.78GB
+rebuild: ddl_cols=42 ddl_pk=2 | create=0.0s copy=3.3s swap=4.4s TOTAL=7.7s
+reader : samples=36 max=0.1s blocked(>1s)=0 total=0.0s
+after  : rows=2764437 pk=[('PRIMARY KEY(code, "time")',)]
+dbsize : 3.78GB -> 3.91GB (+126.9MB)
+VERDICT: 锁表窗口约 8s < 60s => V7 可行（可在批间隙执行）
+
+[可行性判定]
+1. 窗口 7.7s（copy 3.3s + swap 4.4s），远小于批间隔（约 30s）=> 不阻塞采集节奏。
+2. 并发读不阻塞：同配置第二连接 36 次采样最大延迟 0.1s，>1s 次数 0
+   （重建全程在单事务内，MVCC 让读者看到旧快照）。
+3. 行数与主键守恒：2,764,437 行、PRIMARY KEY(code,"time") 均与重建前一致。
+4. 体积不回收：+126.9MB（旧数据块留待复用）=> V7 不解决 F8 膨胀。
+5. DuckDB 1.4.5 不支持 ALTER TABLE DROP CONSTRAINT（NotImplementedException）
+   => V7 只能走 CREATE(带PK) + INSERT SELECT + DROP + RENAME（等价 passthrough 换名）。
+
+[实施注意（实测踩坑，V7 上线必须遵守）]
+1. 必须以实表 schema 建新表：静态 DDL_DUCKDB['stock_daily'] 只有 41 列，缺 data_source
+   （该列由 _migrate_add_columns 补入实表，实表 42 列）=> 用静态 DDL 重建会丢列。
+   实测首次尝试即报 "table ... has 41 columns but 42 values were supplied"。
+   附带结论：V4 staging 用的是 CTAS（SELECT * FROM t LIMIT 0），天然取实表结构，安全。
+2. PK 列解析不能靠引号：duckdb_constraints() 返回 PRIMARY KEY(code, "time")，
+   仅 time 带引号；按引号提取会退化成单列 PK(time) => 插入时报
+   "duplicate key 1660060800000"。须按括号内逗号切分。
+3. 线上执行须持 3A 写锁 + 在批间隙（无活动写事务）执行。

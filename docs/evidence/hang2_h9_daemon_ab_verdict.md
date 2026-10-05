@@ -69,8 +69,13 @@ _write_guard 看门狗、3A 写锁、带 namechange/valuation 的 aligner、QFQ 
 ## 产物
 
 - bench profile：`config/profiles/_bench_h9`（隔离，含 allow-non-main-target 用法范例）
+  —— **已于 2026-10-05 随 `data/bench` 一并清理**（实验结论已归档，工作副本不再保留）
 - 副本库：`data/bench/hang2_h9_daemon.db`（1.4.5 控制组跑后状态）、`data/bench/hang2_h9_qfq_aux.db`
+  —— **已删除**（`data/bench` 于 2026-10-05 整体清理）
 - 日志：`data/logs/_h9_daemon.err.txt`（1.4.5 复现）、`data/logs/_h9_156.err.txt`（1.5.6 跑通）
 - 启动器：`docs/evidence/launch_156.py`（1.5.6 引导，重排 sys.path 让 venv156 的 1.5.6 优先；
   实际最终用 quant310 临时换 1.5.6 完成，因 venv156 的 TLS 栈与 MCP 服务端握手不兼容）
+  —— **该脚本已随 `data/bench/venv156` 清理而移除**（2026-10-05），此处仅存历史记录；
+  如需复跑 1.5.6 引导，请重新建隔离 venv 并按本节所述原理重排 sys.path
 - 监视器：`docs/evidence/hang2_h9_daemon_monitor.py`
+  —— **该脚本已移除**（2026-10-05，其唯一目标库 `data/bench/hang2_h9_daemon.db` 已不存在）

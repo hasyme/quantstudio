@@ -1,0 +1,5 @@
+复制生产库 2.64GB -> 3.2s
+表内行数=2749437  库=2.64GB
+on_conflict    -> OK           1.6s
+plain_insert   -> EXC ConstraintException: Constraint Error: Duplicate key "code:  0.0s
+delete_insert  -> OK           1.7s

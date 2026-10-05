@@ -1,0 +1,56 @@
+# 会话工作区基线（2026-10-05 02:09，dsh 会话）
+# 任务：分析 output/mcp_only_collector_run_20261004_214251/failure_review.md 并出修复方案（六步流水线）
+# 说明：本会话当前只产出方案文档（docs/），不触碰代码。以下未提交改动均为其他会话遗留，
+#       实施阶段必须遵守「写前快照」与「精确文件清单」纪律，禁止盲回退。
+
+## git status --porcelain
+ M README.md
+ M config/profiles/mcp_only/collector_tasks.json
+ M config/profiles/mcp_only/sources_config.json
+ M config/profiles/prehandover_staging/collector_tasks.json
+ D data/snapshots/connection_semantics.json
+ D data/snapshots/lock_adoption_log.json
+ D data/snapshots/read_exemption_evidence.json
+ D data/snapshots/write_path_registry.json
+ M docs/data-pipeline-contract.md
+ M quantstudio/pipeline/sources/mcp_adapter.py
+ M quantstudio/pipeline/writers.py
+?? config/profiles/_bench_h9/
+?? data/bench/
+?? data/snapshots/quantstudio_before_v7online_20261003.db
+?? docs/audit-minute-data-pull-removal-design-v2.md
+?? docs/audit-minute-data-pull-removal-design-v3.md
+?? docs/audit-minute-data-pull-removal-design.md
+?? docs/duckdb-write-stall-mitigation-design.md
+?? docs/duckdb-write-stall-rootcause-v2-design.md
+?? docs/duckdb-write-stall-rootcause-v3-design.md
+?? docs/evidence/_backup_prod.py
+?? docs/evidence/duckdb-write-hang-incident2-20261002.md
+?? docs/evidence/hang2_*.py / .txt / .md / .csv（多文件，见 git status 全量）
+?? docs/handoff/baseline-20261001-202056.txt
+?? docs/handoff/duckdb-write-stall-v2-audit-20261003.md
+?? docs/minute-data-pull-removal-design.md
+?? docs/stock-basic-dataset-kind-fix-audit.md
+?? docs/stock-basic-dataset-kind-fix-design.md
+?? tests/test_writer_stall_watchdog.py
+?? tests/test_writer_variants.py
+
+## git diff --stat
+ README.md                                          |   2 +
+ config/profiles/mcp_only/collector_tasks.json      |  98 ++-
+ config/profiles/mcp_only/sources_config.json       |   8 +-
+ .../prehandover_staging/collector_tasks.json       |   2 +-
+ data/snapshots/connection_semantics.json           | 375 ----------
+ data/snapshots/lock_adoption_log.json              | 135 ----
+ data/snapshots/read_exemption_evidence.json        |  18 -
+ data/snapshots/write_path_registry.json            | 524 --------------
+ docs/data-pipeline-contract.md                     |  16 +
+ quantstudio/pipeline/sources/mcp_adapter.py        |  33 +-
+ quantstudio/pipeline/writers.py                    | 784 +++++++++++++++++++--
+ 11 files changed, 807 insertions(+), 1188 deletions(-)
+
+## 关键提示（供实施阶段）
+- quantstudio/pipeline/sources/mcp_adapter.py 已被其他会话改动（M，+33 行）：
+  本方案实施前必须 git diff 该文件，确认叠加事实并记录（共享核心文件提交纪律第 4 条）。
+- 本会话改动仅限新增文档：docs/handoff/baseline-20261005-0209-mcp-passthrough-fix.txt
+  + docs/mcp-passthrough-first-pull-export-fix-design.md。

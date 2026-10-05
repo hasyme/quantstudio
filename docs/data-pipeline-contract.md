@@ -114,6 +114,22 @@ adapter.fetch_table → aligner.align → validator.validate → writer.write
 - 增量写入、常驻进程、全量拉取，全部走同一条管线
 - PIT 校验（AnnDateLogic）、正值校验（PositiveNumeric）、inf 校验（InfCheck）自动覆盖所有路径
 
+### 写入停摆防护契约（2026-10-02 新增）
+
+`writer.write` 内部**所有**读写语句（去重计数 SELECT、upsert/INSERT、DDL、水位与欠账 upsert、
+passthrough 覆盖写、以及 `mcp_adapter` 的第二条主库写通道）一律经 `_WriteGuard` 执行：
+
+- 单条语句超预算（`QS_DUCKDB_WRITE_TIMEOUT_S`，默认 600s）⇒ `logger.critical` + `conn.interrupt()`；
+- interrupt 后经 `QS_DUCKDB_WRITE_HARD_ABORT_S`（默认 300s）仍不返回 ⇒ 落诊断 JSONL（flush+fsync）
+  后 `os._exit(75)`，释放锁、避免无限空转；
+- 停摆一律转为 `DuckDBWriteStalled` 抛给调用方 ⇒ **任务失败、锁释放、水位不推进**，下轮从断点续跑；
+  事务回滚保证不存在半截数据；
+- 每批日志附 `count/dml/close` 分段耗时，慢批（默认 60s）额外告警；
+- **新增写点必须复用 `_guarded` / `_guarded_executemany`**，由
+  `tests/test_writer_stall_watchdog.py::test_no_bare_execute_in_wrapped_write_paths` 静态锁定。
+
+设计/证据：`docs/duckdb-write-stall-mitigation-design.md`、`docs/evidence/hang2_stall_drill.txt`。
+
 ---
 
 ## 七、相关文件

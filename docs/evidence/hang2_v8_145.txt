@@ -1,0 +1,73 @@
+READ OK version=1.4.5 rows=2764437 cols=42 max_time=1660492800000
+COPY 3.96GB in 4.9s
+upd  batch 001 rows=50000 count=50000 5.60s
+upd  batch 002 rows=50000 count=50000 4.85s
+upd  batch 003 rows=50000 count=50000 4.82s
+upd  batch 004 rows=50000 count=50000 4.86s
+upd  batch 005 rows=50000 count=50000 4.68s
+upd  batch 006 rows=50000 count=50000 5.04s
+upd  batch 007 rows=50000 count=50000 5.62s
+upd  batch 008 rows=50000 count=50000 5.28s
+upd  batch 009 rows=50000 count=50000 5.28s
+upd  batch 010 rows=50000 count=50000 5.08s
+upd  batch 011 rows=50000 count=50000 5.18s
+upd  batch 012 rows=50000 count=50000 5.22s
+upd  batch 013 rows=50000 count=50000 5.19s
+upd  batch 014 rows=50000 count=50000 5.14s
+upd  batch 015 rows=50000 count=50000 5.03s
+upd  batch 016 rows=50000 count=50000 5.18s
+upd  batch 017 rows=50000 count=50000 5.22s
+upd  batch 018 rows=50000 count=50000 5.13s
+upd  batch 019 rows=50000 count=50000 5.51s
+upd  batch 020 rows=50000 count=50000 5.28s
+upd  batch 021 rows=50000 count=50000 5.25s
+upd  batch 022 rows=50000 count=50000 5.01s
+upd  batch 023 rows=50000 count=50000 4.95s
+upd  batch 024 rows=50000 count=50000 5.13s
+upd  batch 025 rows=50000 count=50000 5.09s
+upd  batch 026 rows=50000 count=50000 5.25s
+upd  batch 027 rows=50000 count=50000 4.85s
+upd  batch 028 rows=50000 count=50000 4.82s
+upd  batch 029 rows=50000 count=50000 5.14s
+upd  batch 030 rows=50000 count=50000 5.05s
+upd  batch 031 rows=50000 count=50000 5.33s
+upd  batch 032 rows=50000 count=50000 5.17s
+upd  batch 033 rows=50000 count=50000 5.12s
+upd  batch 034 rows=50000 count=50000 5.12s
+upd  batch 035 rows=50000 count=50000 5.41s
+upd  batch 036 rows=50000 count=50000 5.44s
+upd  batch 037 rows=50000 count=50000 5.06s
+upd  batch 038 rows=50000 count=50000 8.98s
+upd  batch 039 rows=50000 count=50000 6.81s
+upd  batch 040 rows=50000 count=50000 5.39s
+upd  batch 041 rows=50000 count=50000 5.68s
+upd  batch 042 rows=50000 count=50000 5.44s
+upd  batch 043 rows=50000 count=50000 4.93s
+upd  batch 044 rows=50000 count=50000 5.31s
+upd  batch 045 rows=50000 count=50000 5.23s
+upd  batch 046 rows=50000 count=50000 5.58s
+upd  batch 047 rows=50000 count=50000 5.39s
+upd  batch 048 rows=50000 count=50000 10.61s
+upd  batch 049 rows=50000 count=50000 5.23s
+upd  batch 050 rows=50000 count=50000 5.13s
+upd  batch 051 rows=50000 count=50000 5.53s
+upd  batch 052 rows=50000 count=50000 5.47s
+upd  batch 053 rows=50000 count=50000 5.51s
+upd  batch 054 rows=50000 count=50000 5.63s
+upd  batch 055 rows=50000 count=50000 9.19s
+upd  batch 056 rows=50000 count=14437 1.51s
+new  batch 001 rows=50000 2.67s
+new  batch 002 rows=50000 1.92s
+new  batch 003 rows=50000 2.03s
+new  batch 004 rows=50000 2.09s
+new  batch 005 rows=50000 2.02s
+new  batch 006 rows=50000 2.46s
+new  batch 007 rows=50000 2.06s
+new  batch 008 rows=50000 2.14s
+new  batch 009 rows=50000 1.89s
+new  batch 010 rows=50000 2.40s
+new  batch 011 rows=50000 2.15s
+new  batch 012 rows=50000 2.19s
+new  batch 013 rows=50000 2.13s
+new  batch 014 rows=50000 2.16s
+DONE total=333.3s rows_before=2764437 rows_after=3464437

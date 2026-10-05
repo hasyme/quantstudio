@@ -1,0 +1,6 @@
+V7 A2 批前重建 @ 2026-10-04 02:43:33  apply=False
+db=data\quantstudio.db size=3.57GB
+before: rows=2764437 cols=42 pk=['PRIMARY KEY(code, "time")']
+before: min=1577894400000 max=1660492800000
+views referencing stock_daily=0 []
+CHECK-ONLY：未做任何改动。确认无误后加 --apply 执行。

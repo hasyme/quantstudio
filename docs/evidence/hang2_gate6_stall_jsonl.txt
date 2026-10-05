@@ -1,0 +1,16 @@
+{
+  "ts": "2026-10-03T01:28:27",
+  "pid": 26480,
+  "phase": "dml",
+  "table": "stock_daily",
+  "batch_id": "mcp_stock_daily_mcp_20261003_002145_7873f5",
+  "rows": 50000,
+  "sql_head": "INSERT INTO stock_daily (code, time, open, high, low, close, volume, amount, preClose, suspendFlag, open_front, high_fro",
+  "budget_s": 600.0,
+  "hard_abort_s": 300.0,
+  "interrupt_sent": true,
+  "hard_abort": true,
+  "outcome": "budget_exceeded",
+  "db_path": "data\\quantstudio.db",
+  "execute_elapsed_s": 900.005
+}

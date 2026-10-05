@@ -1,0 +1,12 @@
+正常写: submitted=2 new=2 updated=0 守恒=True
+停摆注入: 异常类型=DuckDBWriteStalled 有界收敛耗时=1.7s（预算 1.0s）
+停摆消息: QS_DUCKDB_WRITE_TIMEOUT: 写语句超预算并被 interrupt 中断（表=stock_daily 批次=batch-stall 行数=2 阶段=dml 已耗时=1.5s 预算=1.0s 已发interrupt=True 硬退出启用=False 结局=interrupted_exception）SQL=INSERT INTO stock_daily (code, time, open, close) SELECT * FROM _tmp_write ON
+诊断: table=stock_daily batch=batch-stall rows=2 phase=dml outcome=interrupted_exception interrupt=True hard=False
+诊断SQL头: INSERT INTO stock_daily (code, time, open, close) SELECT * FROM _tmp_write ON CONFLICT (code, time) DO UPDATE 
+停摆后表内行数=2（期望 2：第一批已提交，停摆批未提交）
+恢复后写: submitted=2 new=0 updated=2 守恒=True 表内行数=2（期望仍 2）
+结论A（语句响应 interrupt）: PASS 有界失败+锁释放+无半截+可续跑
+
+场景B：替身不响应 interrupt（无中断标志可轮询）
+场景B: 异常=DuckDBWriteStalled 收敛耗时=4.2s 硬退出码=[75] 诊断hard_abort=True
+结论B（语句不响应 interrupt）: PASS S2 兜底触发 os._exit(75)（生产须保持 S2>0）

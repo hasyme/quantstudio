@@ -1,0 +1,20 @@
+﻿=== audit baseline 20261001-202056 ===
+--- git status --porcelain ---
+ M config/profiles/mcp_only/collector_tasks.json
+ M config/profiles/mcp_only/sources_config.json
+ D data/snapshots/connection_semantics.json
+ D data/snapshots/lock_adoption_log.json
+ D data/snapshots/read_exemption_evidence.json
+ D data/snapshots/write_path_registry.json
+?? docs/handoff/baseline-20261001-202056.txt
+?? docs/minute-data-pull-removal-design.md
+--- git diff --stat ---
+ config/profiles/mcp_only/collector_tasks.json |  91 +++--
+ config/profiles/mcp_only/sources_config.json  |   8 +-
+ data/snapshots/connection_semantics.json      | 375 ------------------
+ data/snapshots/lock_adoption_log.json         | 135 -------
+ data/snapshots/read_exemption_evidence.json   |  18 -
+ data/snapshots/write_path_registry.json       | 524 --------------------------
+ 6 files changed, 49 insertions(+), 1102 deletions(-)
+--- HEAD ---
+7c3e7fb merge origin/main: 归并 daemon.py/quality_audit.py（本地窗口分段+口径门禁 x 远程可中断审计+hold门）

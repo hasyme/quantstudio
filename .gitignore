@@ -103,3 +103,10 @@ agent_workspace/tmpdir*/
 agent_workspace/pytest_basetemp*/
 agent_workspace/_pt[0-9]*_*/
 agent_workspace/qs_write_lock_dir/
+
+# 快照子目录一次性备份大库（data/*.db 仅锚定根目录，子目录需显式忽略；3.7GB 本地备份不入仓，GitHub 单文件硬限 100MB）
+data/snapshots/*.db
+data/snapshots/*.db-wal
+data/snapshots/*.db-shm
+# 技能工作区复制库（本地产物，不入仓）
+skills/**/*.db

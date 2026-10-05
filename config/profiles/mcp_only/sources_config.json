@@ -4,15 +4,21 @@
     "mcp": {
       "enabled": true,
       "name": "mcp",
-      "base_url": "https://124.223.159.234/mcp",
+      "base_url": "https://quantstudio.online/mcp",
       "tls_verify": false,
       "enable_qfq_injection": true,
       "landing_subdir": "mcp_landing",
       "upstream_authority": "mcp",
       "export_async": true,
+      "passthrough_export_fallback": true,
+      "passthrough_export_window_tables": [],
+      "_note_passthrough_export_fallback": "2026-10-05 开启（F-1/F-2 首轮拉取修复 §3.2/§3.4）：passthrough 表 fetch_page 首页超时（含重试预算耗尽）时自适应降级到 export Parquet 通道；false = 完全不探测，_fetch_passthrough 与修复前逐行等效。",
+      "_note_passthrough_export_window_tables": "2026-10-05 置空（fail-safe）：export 窗口下推白名单，元素 = canonical table 名（非 qdb_table）；仅 §3.0 探针「带窗行数==不带窗行数」通过的表才可填入。探针证据见 docs/evidence/mcp-passthrough-window-pushdown-probe-20261005-0403.md——llm_text_events/llm_text_events_enriched/llm_text_raw_feed 三表下推会丢 25,552 行（publish_time 早于任务 start_date 2020-01-01），禁止入名单；其余 5 张候选（cnthesims_events/ai_research_snapshot/rsshub_raw/tdx_theme_news/ws_asfund）虽探针通过但本轮无需下推，故保持空名单，如需启用须先过黄金对比。",
       "_note_export_async": "2026-09-28 开启：异步导出绕过服务端单作业 60s 软时间预算。背景=缺陷1 数据修复 full_range 重拉第 126/136 批触发 export_exceeds_time_budget（服务器繁忙时同步 export 耗时 11~14s→突破 60s），且失败后框架层陷入无退避重放空转（事故记录见 docs/evidence/defect1-repair-attempt1-failure-20260928.md）。async_mode 为本仓库既有能力（mcp_adapter.py:383 注释、client.py:813），默认关；开启后 create_export_job 立即返回 job_id，由 get_manifest(await_ready=True) 轮询至 ready，超时/失败均显式抛错，不静默返回半成品。",
       "_note": "MCP_API_KEY 从环境变量读取（绝不回显），缺失即 fail-fast（见 MCPClient）。main_db 由 daemon 按 data_config.path 注入。upstream_authority=mcp：transport 与上游权威合一（2026-07-21 分离契约随唯一化废止）。"
     }
   },
-  "default_source_priority": ["mcp"]
+  "default_source_priority": [
+    "mcp"
+  ]
 }

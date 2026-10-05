@@ -1,0 +1,12 @@
+A0 基线快照 @ 2026-10-03T17:58:43
+db=data\quantstudio.db bytes=3640143872
+wal=data\quantstudio.db.wal bytes=0
+rows=2764437 distinct_codes=5078 distinct_days=635
+min_time=1577894400000 (2020-01-02) max_time=1660492800000 (2022-08-15)
+CHECKSUM sum_close=63489089.259999 pk_duplicates=0
+watermark=None（⇒ 增量按全量回填）
+stock_daily_valuation rows=8125540
+gate6_baseline_match=NO
+--- 四项在线判定器阈值（已由门6 实测标定）---
+1) 进程存活; 2) 日志字节 30s 窗口 > 0; 3) DB 字节 30s 窗口 > 0;
+4) CPU 30s 窗口 < 20s（单核满载且产出不增 = 停摆）; 5) 总时上界 1800s

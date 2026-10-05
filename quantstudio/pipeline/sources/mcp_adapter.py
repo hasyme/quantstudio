@@ -36,7 +36,10 @@ import pandas as pd
 from quantstudio.pipeline.sources.base import BaseSourceAdapter
 from quantstudio.pipeline.mcp import MCPClient
 from quantstudio.pipeline.mcp.client import load_mcp_api_key
-from quantstudio.pipeline.mcp.errors import MCPClientError, MCPToolError
+from quantstudio.pipeline.mcp.errors import (
+    MCPClientError, MCPToolError, MCPAuthError, MCPProtocolError,
+    MCPTransportError, MCPRetryBudgetExhausted, MCPExportBudgetError,
+)
 from quantstudio.pipeline.qfq_reanchor_schema import aux_db_path
 from quantstudio.pipeline.code_contract import validate_sec_code
 
@@ -321,6 +324,44 @@ _QFQ_ADJFACTOR_TABLES = {("stock_daily", "daily"), ("etf_daily", "daily"),
                          ("etf_minutes", "30min"), ("etf_minutes", "60min")}
 
 
+def _clip_passthrough_dates(df: pd.DataFrame, start: str,
+                            end: str) -> pd.DataFrame:
+    """passthrough 统一口径的客户端日期裁剪（date/trade_date/cal_date 存在时）。
+
+    下推只是性能层，**裁剪才是语义权威**：export 与 fetch_page 两条通道
+    都必须过此函数，保证同口径（2026-10-05 F-1 修复 §3.1.4）。
+    """
+    def _norm_date(v):
+        s = str(v).strip()
+        if len(s) >= 10 and s[4] == "-":
+            s = s[:10].replace("-", "")
+        return s[:8]
+
+    if not len(df):
+        return df
+    date_col = next((c for c in ("date", "trade_date", "cal_date")
+                     if c in df.columns), None)
+    if not date_col:
+        return df
+    dcol = df[date_col].map(_norm_date)
+    s8, e8 = _norm_date(start), _norm_date(end)
+    return df[(dcol >= s8) & (dcol <= e8)].reset_index(drop=True)
+
+
+def _filter_passthrough_codes(df: pd.DataFrame,
+                              codes: Optional[List[str]]) -> pd.DataFrame:
+    """passthrough 统一口径的 codes 过滤（识别 daemon 的 'ALL' 全市场标记）。"""
+    _is_all = codes and (len(codes) == 1 and str(codes[0]).upper() == "ALL")
+    if not codes or _is_all or not len(df):
+        return df
+    want = {str(c) for c in codes}
+    code_col = next((c for c in ("ts_code", "code", "stock_code")
+                     if c in df.columns), None)
+    if not code_col:
+        return df
+    return df[df[code_col].astype(str).isin(want)].reset_index(drop=True)
+
+
 def _resolve_data_root() -> Path:
     """解析 Raw Landing 根目录（DATA_ROOT，回退项目 data/）。
 
@@ -392,6 +433,17 @@ class MCPAdapter(BaseSourceAdapter):
         # 异步导出（服务端已支持 async_mode：立即返回 job_id + status=running）。
         # 默认关——同步路径行为零影响；开启后由 get_manifest 轮询等待。
         self.export_async = bool(config.get("export_async", False))
+        # passthrough fetch_page 首页超时 → 自适应降级 export（2026-10-05 F-2 修复）。
+        # 默认 false ⇒ 完全不探测（_fetch_all_pages 传 max_attempts=None），
+        # _fetch_passthrough 与修复前逐行等效（fail-safe 总开关）。
+        self.passthrough_export_fallback = bool(
+            config.get("passthrough_export_fallback", False))
+        # export 窗口下推白名单（元素 = canonical table 名，非 qdb_table）。
+        # 默认空名单 = 全局不下推（fail-safe）；仅 §3.0 探针通过的表由 profile 显式填写。
+        _wl = config.get("passthrough_export_window_tables") or []
+        self.passthrough_export_window_tables = frozenset(str(x) for x in _wl)
+        # 任务级 call_timeout 同步给 client 的桥接值（None = 尚未 configure_execution）
+        self._client_call_timeout: Optional[float] = None
         # 全局最新因子缓存：{asset_type: {裸码: adj_latest}}；每进程每资产类型只查一次
         self._adj_latest_cache: Dict[str, Dict[str, float]] = {}
         # 已执行过冷启动的资产类型（避免同一进程内重复全历史导出）
@@ -434,10 +486,14 @@ class MCPAdapter(BaseSourceAdapter):
         if self._client is None:
             # 修复2：构造时从 config/secrets.env（GUI 写入）读取 API Key 注入，
             # 不从环境变量隐式依赖，避免 key 泄露到 git 配置。
+            _kw = {}
+            if self._client_call_timeout is not None:
+                _kw["call_timeout"] = float(self._client_call_timeout)
             self._client = MCPClient(
                 endpoint=self.endpoint,
                 tls_verify=self.tls_verify,
                 api_key=load_mcp_api_key(),
+                **_kw,
             )
             # 六步③：首次握手同样按 retry_budget_sec 有界（0/负值 = 不限 = 旧行为）
             self._client.handshake_bounded()  # 建立 session（initialize→mcp-session-id→notifications/initialized）
@@ -475,6 +531,26 @@ class MCPAdapter(BaseSourceAdapter):
     def is_passthrough(table: str) -> bool:
         """类别B 同名 passthrough 表判定（不走 aligner/validator/watermark）。"""
         return table in _PASSTHROUGH_TABLES
+
+    def configure_execution(self, task: Dict) -> None:
+        """任务级执行参数贯通（2026-10-05 F-2 修复 §3.3，收窄版）。
+
+        基类语义全保留，仅额外把 **call_timeout** 同步给 MCPClient：
+          - client 未建 → 记桥接值，构造时传入；已建 → 在 client._lock 内更新；
+          - 取值域守卫：<=0 / 不可解析 ⇒ 回退 client 默认 90（禁止 join(0) 陷阱值）；
+          - **不**同步 retry_max / retry_backoff_sec / rate_per_min（量化见 §4.3）。
+        """
+        super().configure_execution(task)
+        try:
+            ct = float(self.call_timeout)
+        except (TypeError, ValueError):
+            ct = 0.0
+        if not (ct > 0):
+            ct = 90.0
+        self._client_call_timeout = ct
+        if self._client is not None:
+            with self._client._lock:  # noqa: SLF001 - 与 client 内部同锁，防并发读改
+                self._client.call_timeout = ct
 
     # ------------------------------------------------------------------
     # 核心：fetch_table
@@ -537,19 +613,28 @@ class MCPAdapter(BaseSourceAdapter):
         return raw_df, meta
 
     def _fetch_all_pages(self, dataset_id: str,
-                         page_size: int = 50_000) -> Tuple[pd.DataFrame, int]:
+                         page_size: int = 50_000,
+                         max_attempts: Optional[int] = None) -> Tuple[pd.DataFrame, int]:
         """通过已验证的 cursor API 完整拉取一个 MCP 数据集。
 
         服务端 `query_snapshot` 存在 10,000 行硬上限，即使请求更大的 limit
         也会静默截断；因此所有非 export 管线表都必须通过 fetch_page 分页。
+
+        max_attempts（2026-10-05 passthrough 首轮修复）：**仅作用于首页**探测
+        （后续页恒为 None = 旧行为），供调用方做「首页是否可用」的快速判定。
+        默认 None ⇒ 与改动前逐行等效（其余 4 个调用点不受影响）。
         """
         rows: List[Dict] = []
         cursor = ""
         seen_cursors = set()
         pages = 0
+        _first = True
         while True:
+            # 兼容既有 client 桩：max_attempts 仅在非 None 时透传（None = 旧调用形态）
+            _kw = {} if (max_attempts is None or not _first) else {"max_attempts": max_attempts}
             payload = self.client.fetch_page(
-                dataset_id=dataset_id, cursor=cursor, page_size=page_size)
+                dataset_id=dataset_id, cursor=cursor, page_size=page_size, **_kw)
+            _first = False
             page_rows = payload.get("rows", []) or []
             rows.extend(page_rows)
             pages += 1
@@ -570,25 +655,236 @@ class MCPAdapter(BaseSourceAdapter):
     # ------------------------------------------------------------------
     # 类别B passthrough：分页全量取 raw（原样返回，不做任何映射/归一）
     # ------------------------------------------------------------------
+    # ---- F-2 修复：首页超时族判定（2026-10-05） ----
+    @staticmethod
+    def _is_timeout_family(exc: BaseException) -> bool:
+        """判定「超时族」：MCPRetryBudgetExhausted，或 MCPTransportError 且
+        __cause__/__context__ 链（≤3 层）含 TimeoutError。
+
+        必须按异常链判定：探测走 max_attempts=1，单次 TimeoutError 会被
+        _call_with_retry 包成 MCPTransportError（TimeoutError 在 __cause__）。
+        """
+        if isinstance(exc, MCPRetryBudgetExhausted):
+            return True
+        if not isinstance(exc, MCPTransportError):
+            return False
+        cur: Optional[BaseException] = exc
+        hops = 0
+        while cur is not None and hops < 3:
+            if isinstance(cur, TimeoutError):
+                return True
+            nxt = cur.__cause__ if cur.__cause__ is not None else cur.__context__
+            if nxt is None or nxt is cur:
+                break
+            cur = nxt
+            hops += 1
+        return False
+
+    # ---- export 窗口下推 / 分片收缩（2026-10-05 F-1 修复，白名单制） ----
+    def _export_window_bounds(self, table: str, start: str,
+                              end: str) -> Tuple[Optional[str], Optional[str]]:
+        """白名单窗口：仅名单内表才下推半开区间 [start, end+1day)。
+
+        名单外 / 日期解析失败 ⇒ 返回 (None, None)（不传窗口，等效旧行为）。
+        默认名单为空 ⇒ 全局不下推（fail-safe）。
+        """
+        wl = getattr(self, "passthrough_export_window_tables", None) or frozenset()
+        if table not in wl:
+            return (None, None)
+        try:
+            ts_iso = datetime.strptime(
+                str(start).strip()[:10], "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00")
+            te_iso = (datetime.strptime(str(end).strip()[:10], "%Y-%m-%d")
+                      + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00")
+        except (TypeError, ValueError) as e:
+            logger.warning(f"[MCPAdapter] {table} 窗口解析失败，本次不下推窗口: {e}")
+            return (None, None)
+        return (ts_iso, te_iso)
+
+    def _export_once(self, table: str, qdb_table: str,
+                     ts: Optional[str], te: Optional[str],
+                     async_mode: bool) -> pd.DataFrame:
+        """单次 export（父窗或子窗），落 Raw Landing 后读回。"""
+        arts = self.client.export_dataset(
+            dataset_id=qdb_table, page_size=50_000,
+            time_start=ts, time_end=te, row_limit=None,
+            async_mode=async_mode)
+        frames = []
+        for art in arts:
+            local = self._landing_path(f"pt_export_{table}",
+                                       art.artifact_id.replace("/", "_"))
+            local.write_bytes(art.parquet_bytes)
+            frames.append(pd.read_parquet(local))
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    def _export_subwindow(self, table: str, qdb_table: str,
+                          ts: str, te: str,
+                          async_mode: bool) -> Tuple[pd.DataFrame, int]:
+        """子窗 export：返回 (DataFrame, 服务端 manifest 申报行数)。
+
+        与 _export_once 的区别是显式取 manifest.total_rows，供聚合断言
+        （sum(子窗 rows) == len(concat)）核对，防止重叠/漏窗被静默接受。
+        """
+        ref = self.client.create_export_job(
+            dataset_id=qdb_table, page_size=50_000,
+            time_start=ts, time_end=te, row_limit=None, async_mode=async_mode)
+        manifest = self.client.get_manifest(ref, await_ready=async_mode)
+        frames = []
+        for shard in manifest.shards:
+            art = self.client.get_artifact(ref, shard.artifact_id)
+            local = self._landing_path(f"pt_export_{table}",
+                                       art.artifact_id.replace("/", "_"))
+            local.write_bytes(art.parquet_bytes)
+            frames.append(pd.read_parquet(local))
+        df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return df, int(manifest.total_rows or 0)
+
+    @staticmethod
+    def _parse_suggested_shards(raw: object, ts: str,
+                                te: str) -> Optional[List[Tuple[str, str]]]:
+        """校验服务端 suggested_shards：非空、可解析、两两不交且并集覆盖父窗。
+
+        任一条件不满足 ⇒ 返回 None（调用方回落父窗二分）。
+        """
+        if not isinstance(raw, (list, tuple)) or not raw:
+            return None
+
+        def _iso(v) -> Optional[str]:
+            s = str(v).strip()[:19]
+            if len(s) == 8 and s.isdigit():
+                s = f"{s[:4]}-{s[4:6]}-{s[6:8]}T00:00:00"
+            try:
+                return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00")
+            except (TypeError, ValueError):
+                return None
+
+        out: List[Tuple[str, str]] = []
+        for item in raw:
+            if isinstance(item, dict):
+                a, b = _iso(item.get("time_start")), _iso(item.get("time_end"))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                a, b = _iso(item[0]), _iso(item[1])
+            else:
+                return None
+            if a is None or b is None or a >= b:
+                return None
+            out.append((a, b))
+        # 两两不交
+        srt = sorted(out)
+        for i in range(1, len(srt)):
+            if srt[i][0] < srt[i - 1][1]:
+                return None
+        # 并集覆盖父窗
+        if srt[0][0] > ts or srt[-1][1] < te:
+            return None
+        for i in range(1, len(srt)):
+            if srt[i][0] != srt[i - 1][1]:
+                return None
+        return srt
+
+    @staticmethod
+    def _bisect_window(ts: str, te: str, depth: int = 5,
+                       max_jobs: int = 16) -> List[Tuple[str, str]]:
+        """父窗二分：返回两两不交且覆盖父窗的子窗列表（深度≤5、子作业≤16）。"""
+        subs = [(ts, te)]
+        for _ in range(max(0, int(depth))):
+            if len(subs) >= max_jobs:
+                break
+            nxt: List[Tuple[str, str]] = []
+            for (a, b) in subs:
+                try:
+                    da = datetime.strptime(a[:10], "%Y-%m-%d")
+                    db = datetime.strptime(b[:10], "%Y-%m-%d")
+                except (TypeError, ValueError):
+                    nxt.append((a, b))
+                    continue
+                if (db - da).days <= 1:
+                    nxt.append((a, b))
+                    continue
+                mid = da + timedelta(days=(db - da).days // 2)
+                m_iso = mid.strftime("%Y-%m-%dT00:00:00")
+                if m_iso <= a or m_iso >= b:
+                    nxt.append((a, b))
+                    continue
+                nxt.append((a, m_iso))
+                nxt.append((m_iso, b))
+            if len(nxt) > max_jobs or not nxt:
+                break
+            subs = nxt
+        return subs
+
     def _fetch_export_passthrough(self, table: str, freq: str,
                                     start: str, end: str) -> Tuple[pd.DataFrame, Dict]:
-        """F-2：宽文本 passthrough 表的 export 路径。
+        """本轮 F-1 / 历史 F-2（宽文本路由）：passthrough 表的 export 路径。
 
         与 _fetch_passthrough 语义一致（原样返回、不映射/不注入 QFQ），
         仅拉取通道从 fetch_page JSON 改为 export Parquet 分片。
+
+        2026-10-05 修复三项（均为纯增益错误/机制层，成功路径不变）：
+          1. async_mode 贯通（配置 export_async，默认 False = 旧行为）；
+          2. 窗口下推：仅白名单内表下推半开区间（默认空名单 = 不下推）；
+          3. MCPExportBudgetError 消费：仅名单内（本次实际携带窗口）才消费
+             suggested_shards 或按父窗二分；非名单表直接上抛。
         """
         qdb_table = _CANONICAL_TO_QUESTDB.get(table, table)
-        arts = self.client.export_dataset(
-            dataset_id=qdb_table, page_size=50_000,
-            time_start=None, time_end=None, row_limit=None)
-        frames = []
-        for art in arts:
-            local = self._landing_path(f"pt_export_{table}", art.artifact_id.replace("/", "_"))
-            local.write_bytes(art.parquet_bytes)
-            frames.append(pd.read_parquet(local))
-        raw_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-        meta = {"fetch_mode": "export_wide_text", "pages": len(arts),
-                "rows": len(raw_df)}
+        async_mode = bool(getattr(self, "export_async", False))
+        ts, te = self._export_window_bounds(table, start, end)
+        subjobs = 0
+        try:
+            raw_df = self._export_once(table, qdb_table, ts, te, async_mode)
+        except MCPExportBudgetError as e:
+            if ts is None:
+                # 非名单表（本次未携带窗口 ⇒ 无父窗 ⇒ 无子窗/二分可能）：
+                # 不消费 suggested_shards、不做二分，直接上抛（与修复前一致）。
+                logger.error(
+                    f"[MCPAdapter] {table} export 撞服务端预算错误，且该表不在 "
+                    f"passthrough_export_window_tables 白名单（无父窗可收缩），"
+                    f"按修复前语义上抛: {e}")
+                raise
+            logger.warning(
+                f"[MCPAdapter] {table} export 预算错误，按白名单窗口收缩重取: {e}")
+            shards = self._parse_suggested_shards(e.suggested_shards, ts, te)
+            if shards is None:
+                shards = self._bisect_window(ts, te, depth=5, max_jobs=16)
+                logger.warning(
+                    f"[MCPAdapter] {table} suggested_shards 不可用/无效，"
+                    f"回落父窗二分（{len(shards)} 个子窗）")
+            frames = []
+            reported = 0
+            for (a, b) in shards:
+                sub_df, sub_rows = self._export_subwindow(
+                    table, qdb_table, a, b, async_mode)
+                reported += sub_rows
+                frames.append(sub_df)
+            subjobs = len(shards)
+            raw_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            # 聚合断言（M-6）：服务端申报行数与实收行数必须一致，否则先按全列
+            # 去重一次；仍不等 ⇒ 上抛且禁止写入（全量覆盖语义下重复行=污染）。
+            if reported != len(raw_df):
+                logger.warning(
+                    f"[MCPAdapter] {table} 分片聚合不一致 "
+                    f"（sum={reported} vs concat={len(raw_df)}），全列去重重试")
+                raw_df = raw_df.drop_duplicates().reset_index(drop=True)
+                if reported != len(raw_df):
+                    raise MCPClientError(
+                        f"[MCPAdapter] {table} 分片聚合断言失败且去重后仍不一致"
+                        f"（sum={reported} vs concat={len(raw_df)}），禁止写入")
+        # 0 行守卫（m-2）：仅当本次**实际携带窗口**且结果 0 行时才单次回落，
+        # 防「下推 0 行 = CREATE OR REPLACE 清空表」；未下推时的 0 行是合法空表。
+        if ts is not None and len(raw_df) == 0:
+            logger.warning(
+                f"[MCPAdapter] {table} 带窗 export 返回 0 行，单次回落无窗重取")
+            raw_df = self._export_once(table, qdb_table, None, None, async_mode)
+        # 语义对齐：客户端日期裁剪与 _fetch_passthrough 同口径（裁剪是权威）。
+        raw_df = _clip_passthrough_dates(raw_df, start, end)
+        meta = {"fetch_mode": "export_wide_text", "rows": len(raw_df),
+                "source": "mcp", "freq": freq, "table": table,
+                "passthrough": True, "wide_text_export": True,
+                "async": async_mode, "window": bool(ts is not None),
+                "subjobs": subjobs,
+                "lineage": {"transport": "mcp_export_parquet",
+                            "server": self.endpoint,
+                            "async": async_mode, "subjobs": subjobs}}
         return raw_df, meta
 
     def _fetch_passthrough(self, table: str, freq: str, start: str, end: str,
@@ -601,26 +897,66 @@ class MCPAdapter(BaseSourceAdapter):
         - 不触发 §7.2-A QFQ 注入
         """
         qdb_table = _CANONICAL_TO_QUESTDB.get(table, table)
-        df, page_count = self._fetch_all_pages(qdb_table)
-        # 仅做日期窗口裁剪（不改变列），MCP 列名可能是 date/trade_date
-        def _norm_date(v):
-            s = str(v).strip()
-            if len(s) >= 10 and s[4] == "-":
-                s = s[:10].replace("-", "")
-            return s[:8]
-        date_col = next((c for c in ("date", "trade_date", "cal_date") if c in df.columns), None)
-        if len(df) and date_col:
-            dcol = df[date_col].map(_norm_date)
-            s8, e8 = _norm_date(start), _norm_date(end)
-            df = df[(dcol >= s8) & (dcol <= e8)].reset_index(drop=True)
-        # codes 过滤（识别 daemon 的 'ALL' 全市场标记，跳过过滤）
-        _is_all = codes and (len(codes) == 1 and str(codes[0]).upper() == "ALL")
-        if codes and not _is_all and len(df):
-            want = {str(c) for c in codes}
-            code_col = next((c for c in ("ts_code", "code", "stock_code")
-                             if c in df.columns), None)
-            if code_col:
-                df = df[df[code_col].astype(str).isin(want)].reset_index(drop=True)
+        # 开关 false ⇒ 传 None（完全不探测，与修复前逐行等效）
+        # getattr 兜底：裸实例（绕过 __init__ 的既有测试桩）默认 false = 修复前语义
+        probe_attempts = (1 if getattr(self, "passthrough_export_fallback", False)
+                          else None)
+        try:
+            df, page_count = self._fetch_all_pages(qdb_table,
+                                                   max_attempts=probe_attempts)
+        except (MCPAuthError, MCPProtocolError):
+            # 鉴权/协议错误：不可重试、不降级，原样上抛（与旧语义一致）
+            raise
+        except MCPTransportError as e:
+            if not getattr(self, "passthrough_export_fallback", False):
+                raise
+            if not self._is_timeout_family(e):
+                # 其余传输错误（ECONNRESET/10053、非 2xx）：不降级，
+                # 以 max(1, retry_max-1) 重发（总尝试次数与修复前一致，保留重连自愈）
+                logger.warning(
+                    f"[MCPAdapter] {table} 首页非超时传输错误，重发"
+                    f"（max_attempts={max(1, int(getattr(self.client, 'retry_max', 5)) - 1)}）: {e}")
+                df, page_count = self._fetch_all_pages(
+                    qdb_table,
+                    max_attempts=max(1, int(getattr(self.client, "retry_max", 5)) - 1))
+            else:
+                # 首页超时族（含 MCPRetryBudgetExhausted）⇒ 自适应降级 export
+                logger.warning(
+                    f"[MCPAdapter] {table} fetch_page 首页超时，降级 export 通道: {e}")
+                try:
+                    df, fb_meta = self._fetch_export_passthrough(
+                        table, freq, start, end)
+                except Exception as fb:  # noqa: BLE001
+                    raise MCPTransportError(
+                        f"[MCPAdapter] {table} export 降级失败"
+                        f"（首页超时: {e}）: {type(fb).__name__}: {fb}") from fb
+                # 降级结果按 _fetch_passthrough 同口径做日期裁剪 + codes 过滤
+                df = _clip_passthrough_dates(df, start, end)
+                df = _filter_passthrough_codes(df, codes)
+                meta = {
+                    "source": "mcp",
+                    "freq": freq,
+                    "table": table,
+                    "fetch_mode": "export_fallback",
+                    "passthrough": True,
+                    "upstream_authority": "xtquant",
+                    "fallback_reason": f"{type(e).__name__}: {e}",
+                    "export_meta": fb_meta,
+                    "lineage": {
+                        "upstream_authority": "xtquant",
+                        "transport": "mcp_export_parquet",
+                        "server": self.endpoint,
+                        "passthrough": True,
+                        "fallback_from": "fetch_page",
+                    },
+                    "rows": len(df),
+                }
+                logger.info(f"[MCPAdapter] {table}/{freq} 降级 export 拉取 {len(df)} 行")
+                return df, meta
+        # 兜底（m-3）：未经 _call_with_retry 包装的异常（如 cursor 不前进的
+        # ValueError）不在此捕获 ⇒ 不降级，按既有语义上抛。
+        df = _clip_passthrough_dates(df, start, end)
+        df = _filter_passthrough_codes(df, codes)
         meta = {
             "source": "mcp",
             "freq": freq,
@@ -2267,21 +2603,44 @@ class MCPAdapter(BaseSourceAdapter):
                     upsert_sql = (
                         f"INSERT INTO stock_dividend ({conflict}) VALUES ({placeholders}) "
                         f"ON CONFLICT (code, ex_date) DO NOTHING")
+                # W1（审计澄清项 7）：executemany 亦纳入写路径看门狗；停摆异常
+                # DuckDBWriteStalled 必须**先于**下面的 PK 兜底 except 抛出，
+                # 绝不能被"表无 PK → 回退纯 INSERT"分支吞掉。
+                from ..writers import (DuckDBWriteStalled, _guarded_executemany,
+                                       _WriteGuard, _sql_head)
+                _tag = f"ex_date={int(out['ex_date'].min())}~{int(out['ex_date'].max())}"
                 try:
-                    con.executemany(
-                        upsert_sql,
+                    _g1 = _WriteGuard(con, phase="dividend_upsert", table="stock_dividend",
+                                      batch_id=_tag, rows=len(out),
+                                      sql_head=_sql_head(upsert_sql))
+                    _guarded_executemany(
+                        con, _g1, upsert_sql,
                         [tuple(r) for r in out[cols].itertuples(index=False, name=None)])
+                except DuckDBWriteStalled:
+                    raise      # 有界失败：不得被 PK 兜底分支吞掉
                 except Exception:
                     # 回退：表已存在但无 PK（历史/writers 预建）→ 纯插入（daemon 侧去重）
                     logger.debug("[MCPAdapter] stock_dividend 无 PK 约束，回退纯 INSERT")
-                    con.executemany(
-                        f"INSERT INTO stock_dividend ({conflict}) VALUES ({placeholders})",
+                    _plain_sql = (f"INSERT INTO stock_dividend ({conflict}) "
+                                  f"VALUES ({placeholders})")
+                    _g2 = _WriteGuard(con, phase="dividend_plain", table="stock_dividend",
+                                      batch_id=_tag, rows=len(out),
+                                      sql_head=_sql_head(_plain_sql))
+                    _guarded_executemany(
+                        con, _g2, _plain_sql,
                         [tuple(r) for r in out[cols].itertuples(index=False, name=None)])
                 logger.info(f"[MCPAdapter] §7.2-A 注入 stock_dividend {len(out)} 行 → {db_path}")
             finally:
                 con.close()
         except Exception as e:
-            logger.warning(f"[MCPAdapter] stock_dividend 写入失败: {e}")
+            # W6：停摆（写路径有界失败）升级为 error 并带归因；其他异常仍为 warning
+            # （fail-soft 契约不变：注入失败不阻断取数，见 §7.2-A 注释）。
+            if type(e).__name__ == "DuckDBWriteStalled":
+                logger.error(
+                    f"[MCPAdapter] stock_dividend upsert 停摆（该路径不经 writer 通道，"
+                    f"由 W1 看门狗独立守护）：{e}")
+            else:
+                logger.warning(f"[MCPAdapter] stock_dividend 写入失败: {e}")
         finally:
             release_write_lock()
 

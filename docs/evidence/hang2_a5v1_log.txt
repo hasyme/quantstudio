@@ -1,0 +1,21 @@
+11:04:57 INFO __main__: [mcp_stock_daily_mcp_20261003_110457_496804] === START task=mcp_stock_daily source=mcp table=stock_daily/daily ===
+11:04:57 INFO __main__: [mcp_stock_daily_mcp_20261003_110457_496804] INCREMENTAL: 2020-01-01 �� 2026-10-03 (last_watermark=None)
+11:04:57 INFO __main__: [mcp_stock_daily_valuation_mcp_20261003_110457_de9c31] === START task=mcp_stock_daily_valuation source=mcp table=stock_daily_valuation/daily ===
+11:04:57 INFO __main__: [mcp_stock_daily_valuation_mcp_20261003_110457_de9c31] FULL_RANGE: 2019-12-02 �� 2026-10-03 (����ˮλ�� 1790697600000)
+...
+12:12:29 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: wrote 50000 rows (���� 0 + ���� 50000) ���ظ� upsert [timing count=0.14s dml=4.30s close=4.43s]
+12:12:33 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: V1 ������ 50000 �� -> 10 �� 5000 �У�QS_DUCKDB_WRITE_CHUNK_ROWS��
+12:12:37 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: wrote 50000 rows (���� 0 + ���� 50000) ���ظ� upsert [timing count=0.14s dml=4.46s close=4.60s]
+12:12:41 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: V1 ������ 50000 �� -> 10 �� 5000 �У�QS_DUCKDB_WRITE_CHUNK_ROWS��
+12:12:46 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: wrote 50000 rows (���� 0 + ���� 50000) ���ظ� upsert [timing count=0.15s dml=4.48s close=4.63s]
+12:12:50 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: V1 ������ 50000 �� -> 10 �� 5000 �У�QS_DUCKDB_WRITE_CHUNK_ROWS��
+12:12:55 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: wrote 50000 rows (���� 0 + ���� 50000) ���ظ� upsert [timing count=0.15s dml=4.60s close=4.75s]
+12:12:59 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: V1 ������ 50000 �� -> 10 �� 5000 �У�QS_DUCKDB_WRITE_CHUNK_ROWS��
+12:13:04 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: wrote 50000 rows (���� 0 + ���� 50000) ���ظ� upsert [timing count=0.17s dml=4.79s close=4.96s]
+12:13:08 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: V1 ������ 50000 �� -> 10 �� 5000 �У�QS_DUCKDB_WRITE_CHUNK_ROWS��
+12:13:13 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: wrote 50000 rows (���� 0 + ���� 50000) ���ظ� upsert [timing count=0.16s dml=4.93s close=5.09s]
+12:13:18 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: V1 ������ 50000 �� -> 10 �� 5000 �У�QS_DUCKDB_WRITE_CHUNK_ROWS��
+12:13:22 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: wrote 50000 rows (���� 0 + ���� 50000) ���ظ� upsert [timing count=0.16s dml=4.70s close=4.86s]
+12:13:27 INFO quantstudio.pipeline.writers: [DuckDBWriter] stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804: V1 ������ 50000 �� -> 10 �� 5000 �У�QS_DUCKDB_WRITE_CHUNK_ROWS��
+12:23:27 CRITICAL quantstudio.pipeline.writers: [DuckDBWriteStalled] д��䳬Ԥ�� 600.0s���� interrupt��table=stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804 rows=5000 phase=dml_chunk sql=INSERT INTO stock_daily (code, time, open, high, low, close, volume, amount, preClose, suspendFlag, open_front, high_fro
+12:28:27 CRITICAL quantstudio.pipeline.writers: [DuckDBWriteStalled] interrupt �� 300.0s ��δ���� \u21d2 ��������̣������̽��� 75(EX_TEMPFAIL) �˳����ɼ�ֹͣ��.collector_run.lock �� OS �ͷţ����ⲿ�����Ӷϵ����ܡ�table=stock_daily batch=mcp_stock_daily_mcp_20261003_110457_496804 rows=5000 phase=dml_chunk sql=INSERT INTO stock_daily (code, time, open, high, low, close, volume, amount, preClose, suspendFlag, open_front, high_fro

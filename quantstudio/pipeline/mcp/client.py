@@ -530,12 +530,18 @@ class MCPClient:
             raise err[0]
         return result[0]
 
-    def _call_with_retry(self, fn, *args, **kwargs):
+    def _call_with_retry(self, fn, *args, max_attempts: Optional[int] = None, **kwargs):
         """幂等请求重试（**总预算有界** + 线程超时包裹 + 退避 + 心跳）。
 
         六步③（2026-09-18）新增：预算 self.retry_budget_sec（0/负=不限=旧行为）。
         成功路径零变更：预算内的返回值/重试次数/退避序列/请求参数逐项不变；
         仅当剩余预算不足时收窄 join 与退避，耗尽即抛 MCPRetryBudgetExhausted。
+
+        max_attempts（2026-10-05 passthrough 首轮修复，kw-only，绝不进入服务端
+        payload）：**本次调用**的尝试次数上限；None（默认）= 用 self.retry_max，
+        与本次改动前逐行等效。所有「末次判定」（是否重置连接、是否退避 sleep、
+        终态文案）都按**有效上限** eff_max 计算 ⇒ max_attempts=1 时单次失败
+        不 sleep、不 reset，直接抛终态（零空转）。
         """
         last_err: Optional[BaseException] = None
         budget = self.retry_budget_sec
@@ -545,7 +551,9 @@ class MCPClient:
         def _remaining() -> Optional[float]:
             return None if deadline is None else (deadline - time.monotonic())
 
-        for attempt in range(self.retry_max):
+        eff_max = max(1, int(max_attempts)) if max_attempts else int(self.retry_max)
+
+        for attempt in range(eff_max):
             rem = _remaining()
             if rem is not None and rem <= 0:
                 self._raise_budget_exhausted(t0, budget, attempt, last_err)
@@ -571,13 +579,13 @@ class MCPClient:
                 last_err = e
                 wait = self.backoff_sec[min(attempt, len(self.backoff_sec) - 1)]
                 logger.warning(
-                    f"[MCP retry] attempt {attempt + 1}/{self.retry_max} failed: "
+                    f"[MCP retry] attempt {attempt + 1}/{eff_max} failed: "
                     f"{type(e).__name__}: {e}, sleep {wait}s")
                 # P3-2 10053 根因修复：server 间歇性断开连接（如 ECONNRESET/10053），
                 # 重试若复用同一已损坏的 _session 和失效 _session_id 必败。
                 # 对传输层错误（MCPTransportError/网络异常），重试前重置连接并重握手，
                 # 使后续重试走全新 session。这不改变任何数据语义/API 契约。
-                if attempt + 1 < self.retry_max:  # 还有重试机会才重置与退避
+                if attempt + 1 < eff_max:  # 还有重试机会才重置与退避（按本次有效上限）
                     from .errors import MCPTransportError as _TE
                     if isinstance(e, (_TE,)) or isinstance(e, requests.RequestException):
                         try:
@@ -594,7 +602,7 @@ class MCPClient:
                         wait = min(wait, rem)
                     self._sleep_with_heartbeat(wait, "[MCP retry]")
         raise MCPTransportError(
-            f"MCP 重试 {self.retry_max} 次仍失败: {last_err}") from last_err
+            f"MCP 重试 {eff_max} 次仍失败: {last_err}") from last_err
 
     # ---------------- 连接重置（重连） ----------------
     def _reset_connection(self, timeout: Optional[float] = None) -> None:
@@ -766,8 +774,14 @@ class MCPClient:
 
     def fetch_page(self, dataset_id: str, cursor: str = "",
                    page_size: int = 50000,
-                   columns: Optional[List[str]] = None) -> Dict[str, Any]:
-        """分页取数：cursor 必须为字符串，首页传 ""（实测 null 会校验失败）。"""
+                   columns: Optional[List[str]] = None,
+                   *, max_attempts: Optional[int] = None) -> Dict[str, Any]:
+        """分页取数：cursor 必须为字符串，首页传 ""（实测 null 会校验失败）。
+
+        max_attempts（2026-10-05 passthrough 首轮修复）：仅限**本次调用**的尝试
+        次数上限，kw-only 且**不进入服务端 payload**（由 _call_with_retry 消费）。
+        None（默认）= 与改动前逐行等效。
+        """
         args: Dict[str, Any] = {
             "dataset_id": dataset_id,
             "cursor": cursor if cursor is not None else "",
@@ -775,7 +789,8 @@ class MCPClient:
         }
         if columns:
             args["columns"] = list(columns)
-        return self._call_with_retry(self._call_tool, "fetch_page", args)
+        return self._call_with_retry(self._call_tool, "fetch_page", args,
+                                     max_attempts=max_attempts)
 
     def query_updated_since(self, since: str,
                             table: Optional[str] = None) -> List[Dict[str, Any]]:
